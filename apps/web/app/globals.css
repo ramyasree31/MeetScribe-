@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0d0d0d;
+  --color-ink2: #3a3a3a;
+  --color-ink3: #7a7a7a;
+  --color-cream: #f7f4ef;
+  --color-cream2: #ede9e1;
+  --color-accent: #1a5c3a;
+  --color-accent2: #2d7a50;
+  --color-accent-light: #e8f4ed;
+  --color-warn: #c84b1f;
+
+  --font-serif: var(--font-instrument-serif), Georgia, serif;
+  --font-sans: var(--font-dm-sans), system-ui, sans-serif;
+
+  --animate-fade-up: fadeUp 0.6s ease both;
+  --animate-line-in: lineIn 0.4s ease forwards;
+  --animate-pulse-slow: customPulse 2s infinite;
+
+  @keyframes fadeUp {
+    from {
+      opacity: 0;
+      transform: translateY(18px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes lineIn {
+    from {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes customPulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.5;
+      transform: scale(1.4);
+    }
+  }
+}
+
+body {
+  background-color: var(--color-cream);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}

@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  meetings  Meeting[]
+}
+
+model Meeting {
+  id             String   @id @default(cuid())
+  title          String
+  platform       String   // "zoom", "meet", "teams"
+  meetingUrl     String
+  status         String   // "scheduled", "recording", "processing", "completed", "failed"
+  startTime      DateTime?
+  endTime        DateTime?
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  transcript     Transcript?
+  summary        Summary?
+  actionItems    ActionItem[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Transcript {
+  id         String   @id @default(cuid())
+  meetingId  String   @unique
+  meeting    Meeting  @relation(fields: [meetingId], references: [id])
+  content    Json     // Array of { speaker, timestamp, text }
+  createdAt  DateTime @default(now())
+}
+
+model Summary {
+  id         String   @id @default(cuid())
+  meetingId  String   @unique
+  meeting    Meeting  @relation(fields: [meetingId], references: [id])
+  content    String   // Markdown content
+  createdAt  DateTime @default(now())
+}
+
+model ActionItem {
+  id         String   @id @default(cuid())
+  meetingId  String
+  meeting    Meeting  @relation(fields: [meetingId], references: [id])
+  description String
+  assignee   String?
+  dueDate    DateTime?
+  status     String   @default("pending") // "pending", "completed"
+  createdAt  DateTime @default(now())
+}

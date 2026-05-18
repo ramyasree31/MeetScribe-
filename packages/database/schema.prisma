@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum Provider {
+  GOOGLE
+  OUTLOOK
+}
+
+enum Platform {
+  ZOOM
+  MEET
+  TEAMS
+}
+
+enum Status {
+  SCHEDULED
+  JOINING
+  LIVE
+  PROCESSING
+  DONE
+  FAILED
+}
+
+model User {
+  id                   String                @id @default(uuid())
+  email                String                @unique
+  supabaseId           String                @unique
+  createdAt            DateTime              @default(now())
+  workspaces           Workspace[]           @relation("WorkspaceOwner")
+  workspaceMemberships WorkspaceMember[]
+  calendarIntegrations CalendarIntegration[]
+}
+
+model Workspace {
+  id        String            @id @default(uuid())
+  name      String
+  ownerId   String
+  owner     User              @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members   WorkspaceMember[]
+  meetings  Meeting[]
+
+  @@index([ownerId])
+}
+
+model WorkspaceMember {
+  workspaceId String
+  userId      String
+  role        Role      @default(MEMBER)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, userId])
+  @@index([userId])
+}
+
+model CalendarIntegration {
+  id           String   @id @default(uuid())
+  userId       String
+  provider     Provider
+  accessToken  String
+  refreshToken String?
+  expiresAt    DateTime?
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Meeting {
+  id          String       @id @default(uuid())
+  workspaceId String
+  title       String
+  startTime   DateTime
+  endTime     DateTime
+  platform    Platform
+  meetingUrl  String
+  status      Status       @default(SCHEDULED)
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  bots        Bot[]
+  transcripts Transcript[]
+  summaries   Summary[]
+
+  @@index([workspaceId])
+  @@index([startTime, status])
+}
+
+model Bot {
+  id            String    @id @default(uuid())
+  meetingId     String
+  status        String
+  joinedAt      DateTime?
+  leftAt        DateTime?
+  recordingPath String?
+  meeting       Meeting   @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  @@index([meetingId])
+}
+
+model Transcript {
+  id        String              @id @default(uuid())
+  meetingId String
+  fullText  String
+  createdAt DateTime            @default(now())
+  meeting   Meeting             @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  segments  TranscriptSegment[]
+
+  @@index([meetingId])
+}
+
+model TranscriptSegment {
+  id           String     @id @default(uuid())
+  transcriptId String
+  speakerLabel String
+  text         String
+  startMs      Int
+  endMs        Int
+  transcript   Transcript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+
+  @@index([transcriptId])
+}
+
+model Summary {
+  id           String   @id @default(uuid())
+  meetingId    String
+  overview     String
+  actionItems  Json
+  participants Json
+  createdAt    DateTime @default(now())
+  meeting      Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  @@index([meetingId])
+}
