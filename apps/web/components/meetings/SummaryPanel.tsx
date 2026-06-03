@@ -9,13 +9,13 @@ interface SummaryData {
   keyDecisions: string[]
 }
 
-export function SummaryPanel({ socket }: { socket: Socket }) {
+export function SummaryPanel({ socket, meetingId }: { socket: Socket; meetingId: string }) {
   const [summary, setSummary] = useState<SummaryData | null>(null)
 
   useEffect(() => {
-    socket.on('summary_ready', async (data: { summaryId: string }) => {
+    socket.on('summary_ready', async () => {
       try {
-        const res = await fetch(`/api/summaries/${data.summaryId}`)
+        const res = await fetch(`/api/summaries/${meetingId}`)
         if (res.ok) {
           const fetchedSummary = await res.json()
           setSummary(fetchedSummary)
@@ -28,7 +28,8 @@ export function SummaryPanel({ socket }: { socket: Socket }) {
     return () => {
       socket.off('summary_ready')
     }
-  }, [socket])
+  }, [socket, meetingId])
+
 
   if (!summary) {
     return (

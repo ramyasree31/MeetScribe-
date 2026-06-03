@@ -1,7 +1,16 @@
 import React from "react";
 import Link from "next/link";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase/server";
 
-export default function LandingPage() {
+export default async function LandingPage() {
+  // If user is already signed in, send them straight to the bot dashboard
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (user) {
+    redirect("/dashboard");
+  }
+
   return (
     <div className="bg-cream text-ink font-sans min-h-screen overflow-x-hidden selection:bg-accent-light selection:text-accent">
       {/* NAV */}

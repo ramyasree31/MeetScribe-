@@ -19,13 +19,17 @@ export class OrchestratorService {
     const threeMinutesFromNow = new Date(now.getTime() + 3 * 60 * 1000);
 
     try {
+      // Dispatch meetings that fall into any of these buckets:
+      // 1. No startTime set (join immediately / now)
+      // 2. Starting within the next 3 minutes
+      // 3. Already past startTime but never dispatched (orchestrator was down)
       const upcomingMeetings = await this.prisma.meeting.findMany({
         where: {
           status: 'SCHEDULED',
-          startTime: {
-            lte: threeMinutesFromNow,
-            gte: now, // Optional: prevent joining meetings way in the past if worker was down
-          },
+          OR: [
+            { startTime: null },                          // join-now meetings
+            { startTime: { lte: threeMinutesFromNow } },  // starting soon OR already past
+          ],
         },
       });
 
@@ -52,12 +56,11 @@ export class OrchestratorService {
           data: { status: 'JOINING' },
         });
 
-        // Also create the Bot record to track this specific worker instance
-        await this.prisma.bot.create({
-          data: {
-            meetingId: meeting.id,
-            status: 'INITIALIZING',
-          }
+        // Upsert the Bot record (safe for re-dispatch scenarios)
+        await this.prisma.bot.upsert({
+          where: { meetingId: meeting.id },
+          create: { meetingId: meeting.id, status: 'INITIALIZING' },
+          update: { status: 'INITIALIZING', errorMsg: null },
         });
 
         this.logger.log(`Dispatched bot for meeting ${meeting.id} (${meeting.platform})`);

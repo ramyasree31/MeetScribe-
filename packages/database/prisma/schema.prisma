@@ -7,56 +7,127 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ─────────────────────────────────────────────
+// Auth / Users
+// ─────────────────────────────────────────────
+
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  avatarUrl String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String    @id @default(cuid())
+  supabaseId  String    @unique
+  email       String    @unique
+  name        String?
+  avatarUrl   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  meetings    Meeting[]
+  memberships WorkspaceMember[]
+}
+
+// ─────────────────────────────────────────────
+// Workspaces (for team email notifications)
+// ─────────────────────────────────────────────
+
+model Workspace {
+  id        String            @id @default(cuid())
+  name      String
+  createdAt DateTime          @default(now())
+  members   WorkspaceMember[]
   meetings  Meeting[]
 }
 
-model Meeting {
-  id             String   @id @default(cuid())
-  title          String
-  platform       String   // "zoom", "meet", "teams"
-  meetingUrl     String
-  status         String   // "scheduled", "recording", "processing", "completed", "failed"
-  startTime      DateTime?
-  endTime        DateTime?
-  userId         String
-  user           User     @relation(fields: [userId], references: [id])
-  transcript     Transcript?
-  summary        Summary?
-  actionItems    ActionItem[]
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+model WorkspaceMember {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  role        String    @default("member") // "owner", "member"
+  createdAt   DateTime  @default(now())
+
+  @@unique([workspaceId, userId])
 }
+
+// ─────────────────────────────────────────────
+// Meetings
+// ─────────────────────────────────────────────
+
+model Meeting {
+  id          String    @id @default(cuid())
+  title       String
+  platform    String    // "MEET" | "ZOOM" | "TEAMS"
+  meetingUrl  String
+  status      String    @default("SCHEDULED")
+  // SCHEDULED → JOINING → RECORDING → PROCESSING → COMPLETED | FAILED
+  startTime   DateTime?
+  endTime     DateTime?
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id])
+  transcript  Transcript?
+  summary     Summary?
+  actionItems ActionItem[]
+  bot         Bot?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// Bot Worker Instances
+// ─────────────────────────────────────────────
+
+model Bot {
+  id          String   @id @default(cuid())
+  meetingId   String   @unique
+  meeting     Meeting  @relation(fields: [meetingId], references: [id])
+  status      String   @default("INITIALIZING")
+  // INITIALIZING → JOINING → RECORDING → FINISHED | ERROR
+  containerId String?  // Docker container ID for tracking
+  errorMsg    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// Transcripts
+// ─────────────────────────────────────────────
 
 model Transcript {
-  id         String   @id @default(cuid())
-  meetingId  String   @unique
-  meeting    Meeting  @relation(fields: [meetingId], references: [id])
-  content    Json     // Array of { speaker, timestamp, text }
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  meetingId String   @unique
+  meeting   Meeting  @relation(fields: [meetingId], references: [id])
+  // Array of { speaker: string, text: string, startMs: number, endMs: number }
+  content   Json
+  createdAt DateTime @default(now())
 }
+
+// ─────────────────────────────────────────────
+// AI Summaries
+// ─────────────────────────────────────────────
 
 model Summary {
-  id         String   @id @default(cuid())
-  meetingId  String   @unique
-  meeting    Meeting  @relation(fields: [meetingId], references: [id])
-  content    String   // Markdown content
-  createdAt  DateTime @default(now())
+  id            String   @id @default(cuid())
+  meetingId     String   @unique
+  meeting       Meeting  @relation(fields: [meetingId], references: [id])
+  overview      String
+  keyDecisions  Json     @default("[]") // string[]
+  actionItems   Json     @default("[]") // { owner, task, dueDate }[]
+  participants  Json     @default("[]") // { label, role }[]
+  createdAt     DateTime @default(now())
 }
 
+// ─────────────────────────────────────────────
+// Action Items (structured, queryable)
+// ─────────────────────────────────────────────
+
 model ActionItem {
-  id         String   @id @default(cuid())
-  meetingId  String
-  meeting    Meeting  @relation(fields: [meetingId], references: [id])
+  id          String    @id @default(cuid())
+  meetingId   String
+  meeting     Meeting   @relation(fields: [meetingId], references: [id])
   description String
-  assignee   String?
-  dueDate    DateTime?
-  status     String   @default("pending") // "pending", "completed"
-  createdAt  DateTime @default(now())
+  assignee    String?
+  dueDate     DateTime?
+  status      String    @default("PENDING") // PENDING | COMPLETED
+  createdAt   DateTime  @default(now())
 }
+

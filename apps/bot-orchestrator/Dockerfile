@@ -1,26 +1,26 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
+RUN apk add --no-cache openssl
 RUN npm install -g pnpm
-COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
 COPY packages/database ./packages/database
 COPY apps/bot-orchestrator ./apps/bot-orchestrator
 RUN pnpm install --frozen-lockfile
-RUN pnpm --filter database dlx prisma generate
-RUN pnpm --filter bot-orchestrator build
+RUN cd packages/database && pnpm exec prisma generate
+RUN pnpm --filter @meeting-bot/bot-orchestrator build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
+RUN apk add --no-cache openssl
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-RUN npm install -g pnpm
 
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/packages/database/node_modules ./packages/database/node_modules
-COPY --from=builder /app/apps/bot-orchestrator/dist ./dist
-COPY --from=builder /app/apps/bot-orchestrator/package.json ./
+COPY --from=builder /app/packages/database ./packages/database
+COPY --from=builder /app/apps/bot-orchestrator ./apps/bot-orchestrator
 
-USER appuser
 
 ENV NODE_ENV=production
+WORKDIR /app/apps/bot-orchestrator
 CMD ["node", "dist/main.js"]

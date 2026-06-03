@@ -1,25 +1,40 @@
-import { Controller, Post, Body, Req, UnauthorizedException } from '@nestjs/common';
+import { Controller, Post, Body, Req, UseGuards } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
+import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
 
 const prisma = new PrismaClient();
 
 @Controller('users')
+@UseGuards(SupabaseAuthGuard)
 export class UsersController {
+  /**
+   * POST /users/sync
+   * Called once after the user first authenticates so we have a local record
+   * linked to their Supabase identity.
+   */
   @Post('sync')
-  async syncUser(@Req() request: any, @Body() body: { email: string; supabaseId: string }) {
-    // In a real app, verify the Supabase JWT from the Authorization header here
-    const authHeader = request.headers['authorization'];
-    if (!authHeader) throw new UnauthorizedException('Missing token');
+  async syncUser(
+    @Req() req: any,
+    @Body() body: { name?: string; avatarUrl?: string },
+  ) {
+    const supabaseUser = req.supabaseUser; // set by guard
 
     const user = await prisma.user.upsert({
-      where: { supabaseId: body.supabaseId },
-      update: { email: body.email },
+      where: { supabaseId: supabaseUser.id },
+      update: {
+        email: supabaseUser.email,
+        name: body.name,
+        avatarUrl: body.avatarUrl,
+      },
       create: {
-        email: body.email,
-        supabaseId: body.supabaseId,
+        supabaseId: supabaseUser.id,
+        email: supabaseUser.email,
+        name: body.name,
+        avatarUrl: body.avatarUrl,
       },
     });
 
     return { success: true, user };
   }
 }
+

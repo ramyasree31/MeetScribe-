@@ -1,5 +1,25 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalEnv": [
+    "KAFKA_BROKERS",
+    "KAFKA_SASL_USERNAME",
+    "KAFKA_SASL_PASSWORD",
+    "KAFKA_SASL_MECHANISM",
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "DEEPGRAM_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "AUDIO_PROCESSOR_URL",
+    "NEXT_PUBLIC_API_URL",
+    "NEXT_PUBLIC_WS_URL",
+    "FRONTEND_URL",
+    "BOT_WORKER_IMAGE",
+    "DOCKER_NETWORK"
+  ],
   "pipeline": {
     "build": {
       "dependsOn": ["^build"],

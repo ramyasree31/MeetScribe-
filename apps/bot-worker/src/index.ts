@@ -1,12 +1,40 @@
 // apps/bot-worker/src/index.ts
-// Router script to run either the Meet or Zoom bot
+import { runZoomBot }  from './zoom-bot';
+import { runTeamsBot } from './teams-bot';
+import { runWebexBot } from './webex-bot';
 
-const platform = process.env.PLATFORM || 'MEET';
+const platform = (process.env.PLATFORM || 'MEET').toUpperCase();
 
-if (platform === 'ZOOM') {
-  require('./zoom-bot');
-} else {
-  // If we exported main() in meet-bot.ts, we could require it properly, 
-  // but since meet-bot.ts executes on import, requiring it runs it.
-  require('./meet-bot');
+console.log(`[bot-worker] Platform: ${platform}`);
+
+switch (platform) {
+  case 'ZOOM':
+    runZoomBot().catch((err) => {
+      console.error('[bot-worker] Zoom bot fatal error:', err);
+      process.exit(1);
+    });
+    break;
+
+  case 'TEAMS':
+  case 'MICROSOFT_TEAMS':
+    runTeamsBot().catch((err) => {
+      console.error('[bot-worker] Teams bot fatal error:', err);
+      process.exit(1);
+    });
+    break;
+
+  case 'WEBEX':
+  case 'CISCO_WEBEX':
+    runWebexBot().catch((err) => {
+      console.error('[bot-worker] Webex bot fatal error:', err);
+      process.exit(1);
+    });
+    break;
+
+  case 'MEET':
+  case 'GOOGLE_MEET':
+  default:
+    // meet-bot.ts calls main() on import
+    require('./meet-bot');
+    break;
 }

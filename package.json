@@ -4,10 +4,26 @@
   "private": true,
   "scripts": {
     "dev": "turbo run dev",
+    "dev:all": "node scripts/start-dev.js",
     "build": "turbo run build",
     "lint": "turbo run lint"
   },
   "devDependencies": {
     "turbo": "^1.13.0"
-  }
+  },
+  "dependencies": {
+    "@types/dockerode": "^4.0.1",
+    "dockerode": "^5.0.0"
+  },
+  "onlyBuiltDependencies": [
+    "@nestjs/core",
+    "@prisma/client",
+    "@prisma/engines",
+    "cpu-features",
+    "prisma",
+    "protobufjs",
+    "sharp",
+    "ssh2",
+    "unrs-resolver"
+  ]
 }

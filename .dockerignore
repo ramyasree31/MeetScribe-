@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+.git
+.github
+.next
+**/dist
+**/.turbo
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/venv
+screenshot.png
+screenshot-admit.png

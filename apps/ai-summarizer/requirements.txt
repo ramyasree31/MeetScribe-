@@ -2,6 +2,8 @@ aiokafka==0.10.0
 redis==5.0.4
 langchain==0.2.1
 langchain-anthropic==0.1.15
+langchain-google-genai>=1.0.0
 asyncpg==0.29.0
 tenacity==8.3.0
 tiktoken==0.7.0
+python-dotenv==1.0.1
