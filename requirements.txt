@@ -1,0 +1,101 @@
+# ==============================================================================
+# Meeting Bot — Python Dependencies
+# ==============================================================================
+# This file consolidates all Python dependencies across the monorepo.
+# Each service also has its own requirements.txt for isolated installs:
+#   - apps/ai-summarizer/requirements.txt
+#   - apps/audio-processor/requirements.txt
+#
+# ------------------------------------------------------------------------------
+# HOW TO INSTALL
+# ------------------------------------------------------------------------------
+#
+# OPTION 1 — Install ALL Python deps at once (root level):
+#
+#   python3 -m venv .venv              # create a virtual environment
+#   source .venv/bin/activate          # activate it (macOS/Linux)
+#   # OR on Windows: .venv\Scripts\activate
+#   pip install -r requirements.txt    # install everything
+#
+# OPTION 2 — Install per-service (recommended for Docker / CI):
+#
+#   # For the AI Summarizer only:
+#   cd apps/ai-summarizer
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+#   # For the Audio Processor only:
+#   cd apps/audio-processor
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# OPTION 3 — Upgrade all packages to their latest versions:
+#
+#   pip install --upgrade -r requirements.txt
+#
+# NOTE: Python 3.11+ is recommended. Make sure ffmpeg is installed on your
+#       system for the audio-processor's S3 MP3 conversion feature:
+#         macOS:  brew install ffmpeg
+#         Ubuntu: sudo apt-get install ffmpeg
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# apps/ai-summarizer
+# Consumes Kafka events, fetches Redis transcripts, generates AI summaries,
+# and writes results to PostgreSQL via asyncpg.
+# ------------------------------------------------------------------------------
+
+# Kafka async client
+aiokafka==0.10.0
+
+# Redis async client
+redis==5.0.4
+
+# PostgreSQL async driver
+asyncpg==0.29.0
+
+# LangChain core + LLM integrations
+langchain==0.2.1
+langchain-anthropic==0.1.15
+langchain-google-genai>=1.0.0
+
+# Token-aware text splitting (used by TokenTextSplitter)
+tiktoken==0.7.0
+
+# Retry logic with exponential backoff
+tenacity==8.3.0
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+
+# ------------------------------------------------------------------------------
+# apps/audio-processor
+# FastAPI WebSocket server that receives raw PCM audio from bot-workers,
+# runs VAD, streams to Deepgram for transcription, stores in Redis/Kafka,
+# and optionally uploads recordings to S3.
+# ------------------------------------------------------------------------------
+
+# ASGI web framework (WebSocket endpoint)
+fastapi==0.111.0
+
+# ASGI server
+uvicorn==0.29.0
+
+# WebSocket support (used by FastAPI/uvicorn internally)
+websockets==12.0
+
+# Deepgram SDK — live speech-to-text with diarization
+deepgram-sdk==3.2.0
+
+# Voice Activity Detection
+webrtcvad-wheels==2.0.14
+
+# Async file I/O (raw PCM file writing)
+aiofiles==23.2.1
+
+# AWS S3 uploads (audio recordings) — optional but included
+boto3==1.34.100
+
+# aiokafka, redis, and python-dotenv are shared with ai-summarizer (listed above)
