@@ -142,3 +142,4 @@ apps/
 packages/
   database/         # Prisma schema + migrations
 ```
+# MeetScribe-
