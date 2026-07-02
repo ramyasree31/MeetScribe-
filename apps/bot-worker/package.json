@@ -5,14 +5,18 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
-    "dev": "echo Bot worker daemon is in standby. It is launched on-demand by the orchestrator."
+    "dev": "echo Bot worker daemon is in standby. It is launched on-demand by the orchestrator.",
+    "session:setup": "node scripts/refresh-session-mac.cjs --setup",
+    "session:start": "node scripts/refresh-session-mac.cjs",
+    "session:pm2": "pm2 start scripts/refresh-session-mac.cjs --name meetscribe-session --restart-delay 5000"
   },
   "dependencies": {
     "playwright": "1.44.0",
     "dotenv": "^16.4.5",
     "winston": "^3.13.0",
     "puppeteer-stream": "^2.1.1",
-    "ws": "^8.17.0"
+    "ws": "^8.17.0",
+    "kafkajs": "^2.2.4"
   },
   "devDependencies": {
     "typescript": "^5.4.5",

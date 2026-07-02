@@ -4,11 +4,12 @@ load_dotenv()
 import json
 import asyncio
 import aiofiles
+import struct
+import math
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from aiokafka import AIOKafkaProducer
-import webrtcvad
 import redis.asyncio as redis
 
 # ── Optional S3 upload (non-fatal if not configured) ─────────────────────────
@@ -30,7 +31,6 @@ async def upload_audio_to_s3(meeting_id: str, path: str):
 # ── Globals ───────────────────────────────────────────────────────────────────
 kafka_producer: AIOKafkaProducer = None
 redis_client: redis.Redis = None
-vad = webrtcvad.Vad(3)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
             pass
 
 app = FastAPI(lifespan=lifespan)
-deepgram = DeepgramClient(os.getenv("DEEPGRAM_API_KEY", ""))
+deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY", ""))
 
 
 async def emit_meeting_ended(meeting_id: str):
@@ -101,86 +101,159 @@ async def emit_meeting_ended(meeting_id: str):
 @app.websocket("/ws/{meeting_id}")
 async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
     await websocket.accept()
+    print(f"[audio-processor] Bot connected for meeting {meeting_id} — waiting for audio")
 
-    dg_connection = deepgram.listen.live.v("1")
     raw_pcm_path = f"/tmp/{meeting_id}.raw"
-
     audio_file = await aiofiles.open(raw_pcm_path, mode="wb")
 
-    # Track if we already fired meeting.ended (avoid double-emitting)
     meeting_ended_emitted = False
-
-    # ── Deepgram transcript callback ─────────────────────────────────────────
-    # NOTE: Deepgram's live.on() calls this in a sync context via a thread-pool.
-    # We schedule the async work back on the main event loop.
     loop = asyncio.get_event_loop()
 
-    def on_message(self, result, **kwargs):
-        if not result.is_final:
-            return
+    # Speaker tracking — built by correlating Deepgram IDs with active-speaker events from bot
+    current_active_speaker: str = ""          # name currently speaking (from browser energy)
+    speaker_id_to_name: dict[int, str] = {}   # Deepgram speaker int → display name
+    participant_roster: list[str] = []        # ordered list from participants panel
 
-        words = result.channel.alternatives[0].words
-        if not words:
-            return
+    async def save_speaker_names():
+        if redis_client and speaker_id_to_name:
+            mapping = {f"Speaker {k}": v for k, v in speaker_id_to_name.items()}
+            await redis_client.set(f"speaker_names:{meeting_id}", json.dumps(mapping))
+            print(f"[audio-processor] Speaker map saved: {mapping}")
 
-        text = result.channel.alternatives[0].transcript
-        if not text.strip():
-            return
+    # Deepgram connection — created lazily on first audio frame to avoid timeout
+    dg_connection = None
+    dg_started = False
+    transcript_count = 0
 
-        speaker = words[0].speaker if hasattr(words[0], "speaker") else 0
-        start_ms = int(words[0].start * 1000)
-        end_ms = int(words[-1].end * 1000)
+    # Actual sample rate reported by the browser AudioContext.
+    # Default 16000; overridden by 'audio_config' event before first audio frame.
+    configured_sample_rate = 16000
 
-        segment = {
-            "meetingId": meeting_id,
-            "speaker": f"Speaker {speaker}",
-            "text": text,
-            "startMs": start_ms,
-            "endMs": end_ms,
-        }
+    def open_deepgram():
+        nonlocal dg_connection, dg_started
 
-        # Schedule async work onto the event loop from this sync callback
-        async def _send():
-            if kafka_producer:
-                try:
-                    await kafka_producer.send_and_wait(
-                        "transcript.segments",
-                        json.dumps(segment).encode("utf-8"),
-                    )
-                except Exception as e:
-                    print(f"[audio-processor] Kafka send error: {e}")
-            if redis_client:
-                try:
-                    await redis_client.append(
-                        f"transcript:{meeting_id}",
-                        f"[Speaker {speaker}] {text}\n",
-                    )
-                except Exception as e:
-                    print(f"[audio-processor] Redis append error: {e}")
+        options = LiveOptions(
+            model="nova-2",
+            language="en",
+            smart_format=True,
+            punctuate=True,
+            diarize=True,
+            interim_results=True,
+            utterance_end_ms="1200",   # wait 1.2s silence before finalising segment
+            vad_events=True,
+            encoding="linear16",
+            channels=1,
+            sample_rate=configured_sample_rate,
+        )
+        print(f"[audio-processor] Opening Deepgram with sampleRate={configured_sample_rate}")
 
-        asyncio.run_coroutine_threadsafe(_send(), loop)
+        conn = deepgram_client.listen.live.v("1")
 
-    dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        def on_message(self, result, **kwargs):
+            nonlocal transcript_count
+            transcript_count += 1
 
-    options = LiveOptions(
-        model="nova-2",
-        language="en",
-        smart_format=True,
-        diarize=True,
-        interim_results=True,
-        encoding="linear16",
-        channels=1,
-        sample_rate=16000,
-    )
+            is_final = result.is_final
+            try:
+                text_raw = result.channel.alternatives[0].transcript
+            except Exception:
+                text_raw = ""
 
-    if not dg_connection.start(options):
-        await audio_file.close()
-        await websocket.close()
-        return
+            if transcript_count <= 5 or transcript_count % 20 == 0:
+                print(f"[audio-processor] dg callback #{transcript_count} is_final={is_final} text={repr(text_raw[:60])}")
+
+            if not is_final:
+                return
+
+            words = result.channel.alternatives[0].words
+            if not words:
+                return
+
+            text = result.channel.alternatives[0].transcript
+            if not text.strip():
+                return
+
+            # Skip single-word fragments — wait for Deepgram to accumulate more context
+            if len(words) < 3:
+                return
+
+            speaker = words[0].speaker if hasattr(words[0], "speaker") else 0
+            start_ms = int(words[0].start * 1000)
+            end_ms = int(words[-1].end * 1000)
+
+            # Map Deepgram numeric ID → real name using active-speaker correlation
+            if speaker not in speaker_id_to_name:
+                if current_active_speaker:
+                    speaker_id_to_name[speaker] = current_active_speaker
+                    print(f"[audio-processor] Mapped Speaker {speaker} → \"{current_active_speaker}\"")
+                elif participant_roster:
+                    # Fallback: assign by order of first appearance
+                    idx = len(speaker_id_to_name)
+                    if idx < len(participant_roster):
+                        speaker_id_to_name[speaker] = participant_roster[idx]
+
+            display_name = speaker_id_to_name.get(speaker, f"Speaker {speaker}")
+            print(f"[audio-processor] TRANSCRIPT {display_name}: {repr(text)}")
+
+            segment = {
+                "meetingId": meeting_id,
+                "speaker": display_name,
+                "text": text,
+                "startMs": start_ms,
+                "endMs": end_ms,
+            }
+
+            async def _send(seg=segment, spk=speaker, name=display_name):
+                if kafka_producer:
+                    try:
+                        await kafka_producer.send_and_wait(
+                            "transcript.segments",
+                            json.dumps(seg).encode("utf-8"),
+                        )
+                    except Exception as e:
+                        print(f"[audio-processor] Kafka send error: {e}")
+                if redis_client:
+                    try:
+                        await redis_client.append(
+                            f"transcript:{meeting_id}",
+                            f"[{name}] {seg['text']}\n",
+                        )
+                    except Exception as e:
+                        print(f"[audio-processor] Redis append error: {e}")
+
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+
+        def on_error(self, error, **kwargs):
+            nonlocal dg_started
+            print(f"[audio-processor] Deepgram error for {meeting_id}: {error}")
+            dg_started = False  # signal main loop to reopen connection
+
+        def on_close(self, close, **kwargs):
+            print(f"[audio-processor] Deepgram connection closed for {meeting_id}")
+
+        conn.on(LiveTranscriptionEvents.Transcript, on_message)
+        conn.on(LiveTranscriptionEvents.Error, on_error)
+        conn.on(LiveTranscriptionEvents.Close, on_close)
+
+        started = conn.start(options)
+        print(f"[audio-processor] Deepgram opened on first audio, started={started} for {meeting_id}")
+        dg_connection = conn
+        dg_started = started
+        return started
+
+    def frame_rms(frame_bytes: bytes) -> float:
+        n = len(frame_bytes) // 2
+        if n == 0:
+            return 0.0
+        samples = struct.unpack(f'{n}h', frame_bytes[:n * 2])
+        return math.sqrt(sum(s * s for s in samples) / n)
 
     try:
         buffer = b""
-        FRAME_SIZE = 320 * 3  # 30 ms at 16 kHz mono s16le
+        total_bytes = 0
+        frames_sent = 0
+        FRAME_SIZE = 320 * 3        # 30 ms at 16 kHz mono s16le
+        SILENCE_RMS = 150           # int16 RMS below this = silence (≈ -46 dBFS)
 
         while True:
             data = await websocket.receive()
@@ -191,41 +264,89 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
                 except json.JSONDecodeError:
                     continue
 
-                if msg.get("event") == "meeting_ended":
-                    print(f"[audio-processor] Received meeting_ended signal for {meeting_id}")
+                event = msg.get("event")
+
+                if event == "meeting_ended":
+                    print(f"[audio-processor] Received meeting_ended for {meeting_id}")
                     meeting_ended_emitted = True
+                    await save_speaker_names()
                     await emit_meeting_ended(meeting_id)
                     break
+
+                elif event == "audio_config":
+                    new_rate = msg.get("sampleRate", 16000)
+                    if dg_connection is None:
+                        configured_sample_rate = int(new_rate)
+                        print(f"[audio-processor] Sample rate set to {configured_sample_rate} Hz")
+                    else:
+                        print(f"[audio-processor] audio_config arrived after Deepgram already opened (rate={new_rate}) — ignored")
+                    continue
+
+                elif event == "speaker_active":
+                    current_active_speaker = msg.get("name", "")
+                    continue
+
+                elif event == "participant_names":
+                    names = msg.get("names", [])
+                    if names:
+                        participant_roster.clear()
+                        participant_roster.extend(names)
+                        print(f"[audio-processor] Participant roster: {names}")
+                        for i, name in enumerate(names):
+                            if i not in speaker_id_to_name:
+                                speaker_id_to_name[i] = name
+                        await save_speaker_names()
+                    continue
+
                 continue
 
             if "bytes" in data:
                 raw = data["bytes"]
                 await audio_file.write(raw)
                 buffer += raw
+                total_bytes += len(raw)
 
                 while len(buffer) >= FRAME_SIZE:
                     frame = buffer[:FRAME_SIZE]
                     buffer = buffer[FRAME_SIZE:]
-                    try:
-                        is_speech = vad.is_speech(frame, 16000)
-                    except Exception:
-                        is_speech = False
-                    if is_speech:
-                        dg_connection.send(frame)
+
+                    # Before Deepgram opens: skip silent frames so we don't open
+                    # the connection on muted tracks (avoids NET0001 early timeout).
+                    if dg_connection is None:
+                        if frame_rms(frame) < SILENCE_RMS:
+                            continue
+                        ok = open_deepgram()
+                        if not ok:
+                            print(f"[audio-processor] Deepgram failed to start for {meeting_id} — dropping audio")
+                            continue
+
+                    # After Deepgram opens: reopen on disconnect, then send ALL frames
+                    # (including silence) so Deepgram stays alive during speech pauses.
+                    if not dg_started:
+                        print(f"[audio-processor] Reopening Deepgram after disconnect for {meeting_id}")
+                        dg_connection = None
+                        if frame_rms(frame) < SILENCE_RMS:
+                            continue
+                        ok = open_deepgram()
+                        if not ok:
+                            continue
+
+                    dg_connection.send(frame)
+                    frames_sent += 1
+                    if frames_sent == 1 or frames_sent % 200 == 0:
+                        print(f"[audio-processor] {meeting_id}: {frames_sent} frames → Deepgram ({total_bytes} bytes total)")
 
     except WebSocketDisconnect:
-        # Bot disconnected (crash, meeting end, container stop, etc.)
-        # Still emit meeting.ended so summarizer runs.
         print(f"[audio-processor] WebSocket disconnected for {meeting_id} — emitting meeting.ended")
     except Exception as e:
         print(f"[audio-processor] Unexpected error for {meeting_id}: {e}")
     finally:
         await audio_file.close()
-        dg_connection.finish()
+        if dg_connection is not None:
+            dg_connection.finish()
 
-        # Always emit meeting.ended if we haven't yet
+        await save_speaker_names()
         if not meeting_ended_emitted:
             await emit_meeting_ended(meeting_id)
 
-        # Upload raw audio to S3 in background (non-blocking)
         asyncio.create_task(upload_audio_to_s3(meeting_id, raw_pcm_path))

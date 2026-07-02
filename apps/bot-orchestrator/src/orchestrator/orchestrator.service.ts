@@ -1,13 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { PrismaClient } from '@prisma/client'; // Assuming generated in packages/database
+import { PrismaClient } from '@prisma/client';
 import { KafkaService } from '../kafka/kafka.service';
+import { allocateBotAccount } from '@meetscribe/bot-pool';
 import * as crypto from 'crypto';
 
 @Injectable()
 export class OrchestratorService {
   private readonly logger = new Logger(OrchestratorService.name);
-  private readonly prisma = new PrismaClient(); // Typically injected via a PrismaService
+  private readonly prisma = new PrismaClient();
 
   constructor(private readonly kafkaService: KafkaService) {}
 
@@ -42,6 +43,18 @@ export class OrchestratorService {
         // Generate a secure token for the bot to authenticate with the websocket later
         const botToken = crypto.randomBytes(32).toString('hex');
 
+        let botAccountId: string | null = null;
+        if (meeting.platform === 'MEET') {
+          try {
+            const botAccount = await allocateBotAccount(meeting.id);
+            botAccountId = botAccount.id;
+          } catch (err) {
+            this.logger.error(`Failed to allocate bot account for meeting ${meeting.id}: ${(err as Error).message}`);
+            // Skip this meeting for this run; it will be retried next minute
+            continue;
+          }
+        }
+
         // Emit to Kafka
         await this.kafkaService.emit('dispatch.bot', {
           meetingId: meeting.id,
@@ -50,17 +63,21 @@ export class OrchestratorService {
           botToken,
         });
 
-        // Update status to JOINING
+        // Update status to ASSIGNED if MEET, or JOINING for other platforms
+        const targetStatus = meeting.platform === 'MEET' ? 'ASSIGNED' : 'JOINING';
         await this.prisma.meeting.update({
           where: { id: meeting.id },
-          data: { status: 'JOINING' },
+          data: { 
+            status: targetStatus,
+            botAccountId,
+          },
         });
 
         // Upsert the Bot record (safe for re-dispatch scenarios)
         await this.prisma.bot.upsert({
           where: { meetingId: meeting.id },
           create: { meetingId: meeting.id, status: 'INITIALIZING' },
-          update: { status: 'INITIALIZING', errorMsg: null },
+          update: { status: 'INITIALIZING', failureReason: null },
         });
 
         this.logger.log(`Dispatched bot for meeting ${meeting.id} (${meeting.platform})`);

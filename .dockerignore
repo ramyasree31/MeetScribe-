@@ -3,7 +3,8 @@ node_modules
 .git
 .github
 .next
-**/dist
+**/.next
+# dist is included so pre-compiled output is available for services that need it
 **/.turbo
 **/__pycache__
 **/*.pyc

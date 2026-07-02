@@ -20,6 +20,7 @@
     "@prisma/client",
     "@prisma/engines",
     "cpu-features",
+    "esbuild",
     "prisma",
     "protobufjs",
     "sharp",

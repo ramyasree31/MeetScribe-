@@ -90,6 +90,7 @@ services:
       - AUDIO_PROCESSOR_URL=ws://audio-processor:8001
       - DOCKER_NETWORK=meetingbot_default
       - BOT_KAFKA_BROKERS=kafka:29092
+      - BOT_PROFILES_BASE_DIR=${PWD}/apps/bot-worker/profiles
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -133,6 +134,7 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:3000
       - NEXT_PUBLIC_WS_URL=http://localhost:3001
       - API_URL=http://api:3000
+      - REDIS_URL=redis://:redispass@redis:6379
     depends_on:
       - api
       - websocket-server
@@ -145,9 +147,42 @@ services:
     image: meetscribe/bot-worker:latest
     entrypoint: ["echo", "bot-worker image built successfully"]
 
+  # ─── Cookie keepalive — runs every 12 h to prevent Google session expiry ───
+  # Visits accounts.google.com + meet.google.com with existing cookies so Google
+  # extends their expiry. As long as this runs the session never goes stale.
+  cookie-keeper:
+    image: meetscribe/bot-worker:latest
+    depends_on:
+      - bot-worker
+    volumes:
+      - ${PWD}/apps/bot-worker/profiles:/app/profiles
+    environment:
+      - BOT_PROFILES_BASE_DIR=/app/profiles
+    entrypoint: ["/bin/sh", "-c", "while true; do node /app/dist/keep-session.js; sleep 43200; done"]
+    restart: unless-stopped
+
+  # ─── VNC auth: sign into riteshmeetscribe@gmail.com once to get cookies ───
+  # Run: docker compose run --rm --service-ports bot-auth
+  # Then open http://localhost:6080/vnc.html and sign in.
+  # Only needed when cookies.json expires (~30-90 days).
+  bot-auth:
+    build:
+      context: ./apps/bot-worker
+      dockerfile: Dockerfile.auth
+    image: meetscribe/bot-auth:latest
+    ports:
+      - "6080:6080"
+    volumes:
+      - ${PWD}/apps/bot-worker/profiles:/app/profiles
+    environment:
+      - PROFILE_ID=bot001
+    profiles:
+      - setup
+
 volumes:
   postgres_data:
   redis_data:
+  bot_profiles:
 
 networks:
   default:

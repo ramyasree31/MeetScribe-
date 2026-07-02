@@ -23,6 +23,7 @@ export default function LiveMeetingPage() {
   const [title, setTitle] = useState<string>('Meeting')
   const [meetingStatus, setMeetingStatus] = useState<MeetingStatus>('LIVE')
   const [meetingEnded, setMeetingEnded] = useState(false)
+  const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({})
 
   // Poll meeting status to detect when meeting ends
   const pollStatus = useCallback(async () => {
@@ -36,7 +37,6 @@ export default function LiveMeetingPage() {
 
       if (status === 'DONE') {
         setMeetingEnded(true)
-        setActiveTab('summary')
       }
     } catch (_) {}
   }, [id])
@@ -52,6 +52,14 @@ export default function LiveMeetingPage() {
         router.push('/login')
         return
       }
+
+      // Map Speaker 0 → the logged-in user's display name
+      const displayName =
+        session.user.user_metadata?.full_name ||
+        session.user.user_metadata?.name ||
+        session.user.email?.split('@')[0] ||
+        'You'
+      setSpeakerNames({ 'Speaker 0': displayName })
 
       // Fetch meeting title + initial status
       pollStatus()
@@ -71,7 +79,6 @@ export default function LiveMeetingPage() {
       // Auto-switch to summary tab when the AI finishes
       socket.on('summary_ready', () => {
         setMeetingEnded(true)
-        setActiveTab('summary')
         setMeetingStatus('DONE')
       })
 
@@ -166,11 +173,14 @@ export default function LiveMeetingPage() {
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
-            className={`relative px-4 py-3 text-sm font-medium capitalize transition ${
+            className={`relative px-4 py-3 text-sm font-medium capitalize transition flex items-center gap-1.5 ${
               activeTab === tab ? 'text-indigo-600' : 'text-gray-500 hover:text-gray-700'
             }`}
           >
             {tab === 'transcript' ? '📝 Live Transcript' : '✨ AI Summary'}
+            {tab === 'summary' && meetingEnded && activeTab !== 'summary' && (
+              <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+            )}
             {activeTab === tab && (
               <motion.div
                 layoutId="tab-indicator"
@@ -194,7 +204,7 @@ export default function LiveMeetingPage() {
           <div className="h-full">
             {activeTab === 'transcript' && socketRef.current && (
               <div className="h-full p-6">
-                <LiveTranscriptFeed socket={socketRef.current} />
+                <LiveTranscriptFeed socket={socketRef.current} meetingId={id} isDone={isDone} speakerNames={speakerNames} />
               </div>
             )}
             {activeTab === 'summary' && socketRef.current && (

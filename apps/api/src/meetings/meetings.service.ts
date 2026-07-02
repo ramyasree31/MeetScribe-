@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaClient } from '@prisma/client';
 import { Kafka } from 'kafkajs';
 import * as crypto from 'crypto';
+import { allocateBotAccount } from '@meetscribe/bot-pool';
 
 export interface CreateMeetingDto {
   title: string;
@@ -113,6 +114,16 @@ export class MeetingsService {
 
     const botToken = crypto.randomBytes(32).toString('hex');
 
+    let botAccountId: string | null = null;
+    if (meeting.platform === 'MEET') {
+      try {
+        const botAccount = await allocateBotAccount(meeting.id);
+        botAccountId = botAccount.id;
+      } catch (err) {
+        throw new BadRequestException(`Failed to allocate bot account: ${(err as Error).message}`);
+      }
+    }
+
     // Emit to Kafka so the bot-launcher picks it up
     const prod = await getProducer();
     await prod.send({
@@ -128,17 +139,22 @@ export class MeetingsService {
     });
 
     // Update meeting + bot status immediately
+    const targetStatus = meeting.platform === 'MEET' ? 'ASSIGNED' : 'JOINING';
     await prisma.meeting.update({
       where: { id },
-      data: { status: 'JOINING' },
+      data: { 
+        status: targetStatus,
+        botAccountId,
+      },
     });
 
     await prisma.bot.upsert({
       where: { meetingId: id },
       create: { meetingId: id, status: 'INITIALIZING' },
-      update: { status: 'INITIALIZING', errorMsg: null },
+      update: { status: 'INITIALIZING', failureReason: null },
     });
 
-    return { success: true, meetingId: id, status: 'JOINING' };
+    return { success: true, meetingId: id, status: targetStatus };
   }
 }
+

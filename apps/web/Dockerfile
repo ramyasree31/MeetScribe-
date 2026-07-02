@@ -7,6 +7,9 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/web ./apps/web
 RUN pnpm install --frozen-lockfile
 
+# Remove any stale .next cache that may have been copied from the host
+RUN rm -rf /app/apps/web/.next
+
 RUN cd apps/web && pnpm run build
 
 FROM node:22-alpine AS runner

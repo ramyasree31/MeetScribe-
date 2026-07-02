@@ -1,289 +1,732 @@
+/**
+ * meet-bot.ts — Signed-in mode (riteshmeetscribe@gmail.com)
+ * Uses a persistent Chromium profile with cookies.json injected to bypass
+ * Google's bot detection on CreateMeetingDevice.
+ */
+
 import { chromium, BrowserContext, Page } from 'playwright';
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import WebSocket from 'ws';
+import path from 'path';
+import fs from 'fs';
+import { Kafka, Producer } from 'kafkajs';
+
+import { MeetingState, MeetingStateMachine } from './state-machine';
+import { FailureClassifier, JoinFailureReason, FAILURE_TO_STATE } from './failure-classifier';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CONFIG = {
+  meetingUrl:        requiredEnv('MEETING_URL'),
+  meetingId:         requiredEnv('MEETING_ID'),
+  profileDir:        path.resolve(process.env.BOT_PROFILE_DIR ?? '/app/profiles/bot001-fresh'),
+  audioProcessorUrl: process.env.AUDIO_PROCESSOR_URL ?? 'ws://audio-processor:8001',
+  botName:           process.env.BOT_NAME ?? 'AI Notetaker',
+  kafkaBrokers:      (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(','),
+  // RC-7 fix: /app only exists in Docker. Fall back to CWD so local runs get screenshots.
+  screenshotDir:     process.env.SCREENSHOT_DIR ?? (fs.existsSync('/app') ? '/app' : process.cwd()),
+
+  /** How long to wait in the lobby for the host to admit the bot (ms). */
+  admissionTimeoutMs: parseInt(process.env.ADMISSION_TIMEOUT_MS ?? '120000', 10),
+
+  /** Max time to wait for Chrome to navigate to the meeting URL (ms). */
+  navTimeoutMs: parseInt(process.env.NAV_TIMEOUT_MS ?? '60000', 10),
+
+  /** Interval to poll for meeting-end signals (ms). */
+  meetingCheckIntervalMs: parseInt(process.env.MEETING_CHECK_INTERVAL_MS ?? '3000', 10),
+
+  /** Alone-for N checks before auto-leaving. Default 20 = 60 s at 3 s interval. */
+  aloneCountThreshold: parseInt(process.env.ALONE_COUNT_THRESHOLD ?? '20', 10),
+} as const;
+
+function requiredEnv(key: string): string {
+  const val = process.env[key];
+  if (!val) {
+    console.error(`[meet-bot] Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+  return val;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Logging
+// ─────────────────────────────────────────────────────────────────────────────
+
+const log = {
+  info:  (...args: unknown[]) => console.log( '[meet-bot]',  ...args),
+  warn:  (...args: unknown[]) => console.warn( '[meet-bot]', ...args),
+  error: (...args: unknown[]) => console.error('[meet-bot]', ...args),
+  diag:  (...args: unknown[]) => console.log( '[meet-bot/diag]', ...args),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-function isSignInPage(url: string): boolean {
-  return (
-    url.includes('accounts.google.com') ||
-    url.includes('google.com/accounts') ||
-    url.includes('google.com/ServiceLogin') ||
-    url.includes('signin/identifier')
-  );
-}
-
-function isKickedPage(url: string): boolean {
-  // Meet redirects to these URLs when a guest is rejected / kicked
-  return (
-    url.includes('meet.google.com/') &&
-    (url.includes('?authuser') === false) &&
-    !url.match(/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/)
-  );
-}
-
-async function saveScreenshot(page: Page, filename: string): Promise<void> {
+async function saveScreenshot(page: Page, label: string): Promise<void> {
   try {
-    await page.screenshot({ path: `/app/${filename}`, fullPage: true });
-    console.log(`[meet-bot] Screenshot saved: ${filename}`);
+    const filepath = path.join(CONFIG.screenshotDir, `screenshot-${label}.png`);
+    await page.screenshot({ path: filepath, fullPage: true });
+    log.diag(`Screenshot saved: ${label}.png`);
   } catch (err) {
-    console.error(`[meet-bot] Failed to save screenshot "${filename}":`, (err as Error).message);
+    log.warn(`Screenshot failed (${label}):`, (err as Error).message);
   }
 }
 
-async function getParticipantCount(page: Page): Promise<number> {
+async function saveDiagnostics(page: Page, label: string): Promise<void> {
+  await saveScreenshot(page, label);
   try {
-    // Try the participants panel button which shows a count
-    const selectors = [
-      '[data-tooltip*="Show everyone"]',
-      '[aria-label*="Show everyone"]',
-      '[data-tooltip*="people"]',
-      '[aria-label*="people"]',
-      '[data-tooltip*="Participants"]',
-      '[aria-label*="Participants"]',
-    ];
-
-    for (const selector of selectors) {
-      const el = page.locator(selector).first();
-      if (await el.isVisible().catch(() => false)) {
-        const text =
-          (await el.getAttribute('aria-label').catch(() => '')) ||
-          (await el.getAttribute('data-tooltip').catch(() => '')) ||
-          (await el.innerText().catch(() => ''));
-        const match = text.match(/\d+/);
-        if (match) {
-          const val = parseInt(match[0], 10);
-          if (!isNaN(val)) return val;
-        }
-      }
-    }
-
-    const participantElements = await page.$$('[data-participant-id]');
-    if (participantElements.length > 0) return participantElements.length;
-  } catch (_) {}
-  return 0;
+    const html = await page.content().catch(() => '');
+    const filepath = path.join(CONFIG.screenshotDir, `dom-${label}.html`);
+    fs.writeFileSync(filepath, html, 'utf8');
+    log.diag(`DOM HTML saved: dom-${label}.html`);
+  } catch {/* best-effort */}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dismiss popups / banners
+// Kafka
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Dismiss every Google popup that blocks the lobby UI.
- * Most importantly: the "Sign in with your Google account – Got it" tooltip
- * that appears on top of the name input and "Ask to join" button.
- */
-async function dismissAllPopups(page: Page): Promise<void> {
-  const clickables = [
-    // The "Got it" in the "Sign in with Google – Got it" tooltip
+let producer: Producer | null = null;
+
+async function getKafkaProducer(): Promise<Producer | null> {
+  if (producer) return producer;
+  try {
+    const kafka = new Kafka({
+      clientId: `meet-bot-${CONFIG.meetingId}`,
+      brokers: CONFIG.kafkaBrokers,
+    });
+    producer = kafka.producer();
+    await producer.connect();
+    log.info('Kafka producer connected');
+    return producer;
+  } catch (err) {
+    log.warn('Kafka unavailable — state events will be skipped:', (err as Error).message);
+    return null;
+  }
+}
+
+async function emitKafkaEvent(
+  topic: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const prod = await getKafkaProducer();
+  if (!prod) return;
+  try {
+    await prod.send({
+      topic,
+      messages: [{ value: JSON.stringify({ ...payload, ts: new Date().toISOString() }) }],
+    });
+  } catch (err) {
+    log.warn(`Kafka emit failed (topic=${topic}):`, (err as Error).message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dismiss popups that block the lobby UI
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function dismissPopups(page: Page): Promise<void> {
+  const selectors = [
     'button:has-text("Got it")',
-    'span:has-text("Got it")',
-    'div[role="button"]:has-text("Got it")',
-    'div[role="button"]:has-text("got it" i)',
-    'span:has-text("got it" i)',
-    'button:has-text("got it" i)',
-    '[aria-label="Got it"]',
-    '[aria-label*="Got it" i]',
-    // GDPR / cookie banners
     'button:has-text("Accept all")',
     'button:has-text("I agree")',
-    'button:has-text("Agree")',
     'button:has-text("Dismiss")',
-    'button:has-text("Close")',
+    '[aria-label="Got it"]',
   ];
 
-  for (const selector of clickables) {
+  for (const sel of selectors) {
     try {
-      const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 1500 })) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1000 })) {
         await btn.click();
-        console.log(`[meet-bot] Dismissed popup: "${selector}"`);
-        await sleep(400);
+        log.info(`Dismissed popup: "${sel}"`);
+        await sleep(300);
       }
-    } catch (_) {}
+    } catch {/* ignore */}
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Enter bot name
+// ─────────────────────────────────────────────────────────────────────────────
+// Click "Join now" — single attempt, returns true/false
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function enterBotName(page: Page, botName: string): Promise<void> {
-  // Wait for the name input to be visible (up to 15 s)
-  const nameInputSelectors = [
-    'input[aria-label="Your name"]',
-    'input[placeholder="Your name"]',
-    'input[aria-label*="name" i]',
+async function fillNameFieldIfPresent(page: Page): Promise<void> {
+  // Google Meet shows a "What's your name?" input in the guest/unauthenticated lobby.
+  // The join button stays disabled until a name is entered. Fill it with BOT_NAME.
+  const nameSelectors = [
     'input[placeholder*="name" i]',
-    'input[type="text"]',
+    'input[aria-label*="name" i]',
+    'input[data-testid*="name" i]',
   ];
-
-  for (const selector of nameInputSelectors) {
+  for (const sel of nameSelectors) {
     try {
-      const input = page.locator(selector).first();
-      if (await input.isVisible({ timeout: 5000 })) {
-        await input.click({ clickCount: 3 }); // select all existing text
-        await input.pressSequentially(botName, { delay: 120 });
-        console.log(`[meet-bot] Filled name "${botName}" via: ${selector}`);
+      const input = page.locator(sel).first();
+      if (!await input.isVisible({ timeout: 1000 })) continue;
+      const current = await input.inputValue().catch(() => '');
+      if (current.length > 0) {
+        log.info(`Name field already filled: "${current}"`);
         return;
       }
-    } catch (_) {}
-  }
-
-  // Also try role=textbox
-  try {
-    const input = page.getByRole('textbox').first();
-    if (await input.isVisible({ timeout: 3000 })) {
-      await input.click({ clickCount: 3 });
-      await input.pressSequentially(botName, { delay: 120 });
-      console.log(`[meet-bot] Filled name "${botName}" via role=textbox`);
+      await input.fill(CONFIG.botName);
+      await sleep(300);
+      log.info(`Filled name field with: "${CONFIG.botName}"`);
       return;
-    }
-  } catch (_) {}
-
-  console.warn('[meet-bot] Could not find name input — will join with existing/empty name');
+    } catch { /* try next */ }
+  }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Click Ask to Join / Join Now
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function clickJoinButton(page: Page): Promise<boolean> {
+  // Fill the guest name field first — "Ask to join" stays disabled without it
+  await fillNameFieldIfPresent(page);
+
   const labels = [
-    /^ask to join$/i,
     /^join now$/i,
     /^join meeting$/i,
-    /ask to join/i,
+    /^ask to join$/i,
     /join now/i,
+    /ask to join/i,
   ];
+
+  log.diag(`URL when looking for join button: ${page.url()}`);
 
   for (const label of labels) {
     try {
       const btn = page.getByRole('button', { name: label }).first();
-      if (await btn.isVisible({ timeout: 6000 })) {
-        // Wait up to 5s for the button to be enabled (it is disabled if name isn't fully filled yet)
-        let isEnabled = false;
-        for (let i = 0; i < 10; i++) {
-          if (await btn.isEnabled().catch(() => false)) {
-            isEnabled = true;
-            break;
-          }
-          await sleep(500);
-        }
-        if (isEnabled) {
-          await btn.hover().catch(() => {});
-          await sleep(800);
-          await btn.click();
-          console.log(`[meet-bot] Clicked join button: "${label instanceof RegExp ? label.source : label}"`);
-          return true;
-        } else {
-          console.warn(`[meet-bot] Button "${label instanceof RegExp ? label.source : label}" found but remained disabled`);
-        }
-      }
-    } catch (_) {}
-  }
+      if (!await btn.isVisible({ timeout: 2000 })) continue;
 
-  // CSS fallback
-  try {
-    const btn = page.locator('button:has-text("Ask"), button:has-text("Join")').first();
-    if (await btn.isVisible({ timeout: 4000 })) {
-      let isEnabled = false;
-      for (let i = 0; i < 8; i++) {
-        if (await btn.isEnabled().catch(() => false)) {
-          isEnabled = true;
-          break;
-        }
+      // Wait up to 10s for the button to become enabled (mic/cam loading)
+      for (let i = 0; i < 20; i++) {
+        if (await btn.isEnabled().catch(() => false)) break;
+        if (i % 4 === 0) await dismissPopups(page);
         await sleep(500);
       }
-      if (isEnabled) {
-        await btn.hover().catch(() => {});
-        await sleep(800);
-        await btn.click();
-        console.log('[meet-bot] Clicked join button via CSS fallback');
-        return true;
-      }
-    }
-  } catch (_) {}
 
-  const bodyText = await page.innerText('body').catch(() => '');
-  console.log('[meet-bot] Page body text snippet:', bodyText.substring(0, 1000).replace(/\n+/g, ' | '));
-  console.warn('[meet-bot] Could not find or click enabled join button');
+      if (!await btn.isEnabled().catch(() => false)) {
+        log.warn(`Join button "${label}" found but stayed disabled after 10s`);
+        continue;
+      }
+
+      const html = await btn.evaluate((el) => el.outerHTML).catch(() => '?');
+      log.diag(`Join button HTML: ${html}`);
+      await btn.hover().catch(() => {});
+      await sleep(300);
+      await btn.click();
+      log.info(`Clicked join button: "${label}"`);
+      await sleep(800);
+      return true;
+    } catch { /* try next label */ }
+  }
+
+  // CSS text fallback (handles translated UI or minor text changes)
+  try {
+    const btn = page.locator('button:has-text("Join"), button:has-text("Ask")').first();
+    if (await btn.isVisible({ timeout: 2000 }) && await btn.isEnabled().catch(() => false)) {
+      await btn.click();
+      log.info('Clicked join button via CSS fallback');
+      return true;
+    }
+  } catch { /* ignore */ }
+
   return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wait until actually inside the call
+// Retry wrapper: attempt join up to maxAttempts times with re-dismiss between tries
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Returns true if we detected we are inside the meeting.
- * Returns false if kicked / timed out.
- */
-async function waitUntilAdmitted(page: Page, timeoutMs = 90000): Promise<boolean> {
-  console.log('[meet-bot] Waiting to be admitted (up to 90 s)...');
+async function isAlreadyInCallOrWaitingRoom(page: Page): Promise<'in_call' | 'waiting_room' | 'none'> {
+  const leaveVisible = await page.locator('[aria-label="Leave call"]').first()
+    .isVisible({ timeout: 1500 }).catch(() => false);
+  if (!leaveVisible) return 'none';
 
-  // Selectors that only exist INSIDE a live call (never in lobby)
+  // Leave call button is present — bot is either in waiting room or already admitted.
+  // Distinguish by checking page text.
+  const bodyText = await page.innerText('body').catch(() => '');
+  if (
+    bodyText.includes('You have joined the call') ||
+    bodyText.includes("There's") ||
+    bodyText.includes('other person') ||
+    bodyText.includes('other people')
+  ) {
+    return 'in_call';
+  }
+  if (
+    bodyText.includes('Please wait') ||
+    bodyText.includes('bring you into the call') ||
+    bodyText.includes('meeting host')
+  ) {
+    return 'waiting_room';
+  }
+  // Leave call visible but can't classify — assume waiting room to be safe
+  return 'waiting_room';
+}
+
+async function clickJoinWithRetry(
+  page: Page,
+  maxAttempts = 3,
+  retryDelayMs = 4000,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    log.info(`Join attempt ${attempt}/${maxAttempts} — URL: ${page.url()}`);
+    await saveDiagnostics(page, `join-attempt-${attempt}`);
+
+    // Check FIRST if bot is already inside or in waiting room.
+    // This happens when: (1) join button was clicked on a previous attempt and
+    // succeeded silently, (2) host auto-admitted the bot, (3) bot rejoined.
+    // In all these cases the "Join now" button is gone — stop retrying.
+    const callState = await isAlreadyInCallOrWaitingRoom(page);
+    if (callState === 'in_call') {
+      log.info(`Attempt ${attempt}: Bot already inside the call — skipping join click`);
+      return true;
+    }
+    if (callState === 'waiting_room') {
+      log.info(`Attempt ${attempt}: Bot in waiting room — handing off to admission wait`);
+      return true;
+    }
+
+    // Dismiss any overlay dialogs that may be blocking the button
+    for (let i = 0; i < 3; i++) {
+      await dismissPopups(page);
+      await sleep(400);
+    }
+
+    const clicked = await clickJoinButton(page);
+    if (clicked) {
+      await saveDiagnostics(page, `after-join-click-attempt-${attempt}`);
+      return true;
+    }
+
+    const bodySnippet = (await page.innerText('body').catch(() => '')).substring(0, 600);
+    log.warn(`Join button not found on attempt ${attempt} — waiting ${retryDelayMs}ms before retry`);
+    log.diag(`Page text snapshot: ${bodySnippet.replace(/\n+/g, ' | ')}`);
+
+    if (attempt < maxAttempts) {
+      await sleep(retryDelayMs);
+      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    }
+  }
+
+  const bodySnippet = (await page.innerText('body').catch(() => '')).substring(0, 800);
+  log.error(`All ${maxAttempts} join attempts failed. Final page text: ${bodySnippet.replace(/\n+/g, ' | ')}`);
+  await saveDiagnostics(page, 'join-all-attempts-failed');
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wait until admitted OR failure detected
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AdmissionResult {
+  admitted: boolean;
+  failureReason: JoinFailureReason | null;
+}
+
+async function waitUntilAdmitted(
+  page: Page,
+  classifier: FailureClassifier,
+  timeoutMs = CONFIG.admissionTimeoutMs,
+): Promise<AdmissionResult> {
+  log.info(`Waiting for admission (up to ${timeoutMs / 1000}s)…`);
+
   const inCallSelectors = [
     '[aria-label="Leave call"]',
     '[data-tooltip="Leave call"]',
-    'button[jsname="HlFzId"]',           // hangup button jsname
-    '[data-participant-id]',              // another participant tile
-  ];
-
-  // Selectors that indicate we were rejected / kicked
-  const rejectedTexts = [
-    "You can't join this video call",
-    'The video call ended because the connection was lost',
-    'You have been removed from the meeting',
-    'This call has ended',
+    'button[jsname="HlFzId"]', // hangup jsname
+    '[data-participant-id]',
   ];
 
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    // Check rejection
-    for (const text of rejectedTexts) {
-      const visible = await page.locator(`text="${text}"`).isVisible().catch(() => false);
-      if (visible) {
-        console.log(`[meet-bot] Detected rejection: "${text}"`);
-        return false;
-      }
+    // ── Check for failure ──────────────────────────────────────────────────
+    const reason = await classifier.classify(page);
+    if (reason !== null) {
+      await saveDiagnostics(page, 'failure-state');
+      log.error(`Join failure classified: ${reason} — ${FailureClassifier.describe(reason)}`);
+      return { admitted: false, failureReason: reason };
     }
 
-    // Check in-call indicators
-    for (const selector of inCallSelectors) {
-      const visible = await page.locator(selector).first().isVisible().catch(() => false);
-      if (visible) {
-        console.log('[meet-bot] ✅ Detected in-call indicator:', selector);
-        return true;
+    // ── Check for success ──────────────────────────────────────────────────
+    for (const sel of inCallSelectors) {
+      if (await page.locator(sel).first().isVisible().catch(() => false)) {
+        await saveDiagnostics(page, 'admitted-success');
+        log.info(`✅ In-call indicator found: ${sel}`);
+        return { admitted: true, failureReason: null };
       }
     }
 
     await sleep(1000);
   }
 
-  console.log('[meet-bot] Timed out waiting for admission');
-  return false;
+  log.warn('Admission timed out');
+  await saveDiagnostics(page, 'admission-timeout');
+  return { admitted: false, failureReason: JoinFailureReason.UNKNOWN };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Participant count (for alone-detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getParticipantCount(page: Page): Promise<number> {
+  const selectors = [
+    '[data-tooltip*="people"]',
+    '[aria-label*="people"]',
+    '[data-tooltip*="Participants"]',
+    '[aria-label*="Participants"]',
+    '[data-tooltip*="Show everyone"]',
+  ];
+
+  for (const sel of selectors) {
+    const el = page.locator(sel).first();
+    if (!await el.isVisible().catch(() => false)) continue;
+    const text =
+      await el.getAttribute('aria-label').catch(() => '') ||
+      await el.getAttribute('data-tooltip').catch(() => '') ||
+      await el.innerText().catch(() => '');
+    const match = text.match(/\d+/);
+    if (match) return parseInt(match[0], 10);
+  }
+
+  const tiles = await page.$$('[data-participant-id]');
+  return tiles.length;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio capture via FFmpeg + PulseAudio
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Capture audio from within the browser by intercepting WebRTC remote tracks.
+ * Works on all platforms — no ffmpeg / PulseAudio / BlackHole needed.
+ * Each incoming audio track from remote participants is connected to a Web Audio
+ * ScriptProcessorNode that converts Float32 PCM → Int16 and sends it to Node.js
+ * via exposeFunction, which forwards it to the audio-processor WebSocket.
+ */
+async function setupBrowserAudioCapture(
+  context: BrowserContext,
+  ws: WebSocket,
+): Promise<void> {
+  let chunkCount = 0;
+  let nonSilentChunks = 0;
+  await context.exposeFunction('__meetscribeAudioChunk', (base64: string, rmsDb: number) => {
+    chunkCount++;
+    const isSilent = rmsDb < -50;
+    if (!isSilent) nonSilentChunks++;
+    if (chunkCount === 1 || chunkCount % 50 === 0) {
+      log.info(`[audio] chunk #${chunkCount} rms=${rmsDb.toFixed(1)}dB ${isSilent ? '(silence)' : '(SPEECH)'} nonSilent=${nonSilentChunks} ws=${ws.readyState}`);
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(Buffer.from(base64, 'base64'));
+    }
+  });
+
+  await context.exposeFunction('__meetscribeInfo', (info: string) => {
+    log.info(`[browser/diag] ${info}`);
+  });
+
+  // Receives actual AudioContext sample rate from browser — forwarded to audio-processor
+  // so Deepgram is configured with the real rate (browser may ignore the 16000 hint)
+  await context.exposeFunction('__meetscribeAudioConfig', (config: { sampleRate: number }) => {
+    log.info(`[audio] Browser AudioContext actual sampleRate=${config.sampleRate}`);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'audio_config', sampleRate: config.sampleRate }));
+    }
+  });
+
+  // Active speaker name reported from browser when the loudest track changes
+  await context.exposeFunction('__meetscribeActiveSpeaker', (name: string) => {
+    log.info(`[speaker] Active speaker: "${name}"`);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'speaker_active', name }));
+    }
+  });
+
+  // Participant roster reported from DOM scraping after joining
+  await context.exposeFunction('__meetscribeParticipants', (names: string[]) => {
+    log.info(`[speaker] Participants: ${names.join(', ')}`);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'participant_names', names }));
+    }
+  });
+
+  await context.addInitScript(() => {
+    const OrigRTC = window.RTCPeerConnection;
+    let audioCtx: AudioContext | null = null;
+    let processorInput: GainNode | null = null;
+    let processor: any = null;
+
+    // Per-track state for active speaker detection
+    const trackAnalysers: Map<string, AnalyserNode> = new Map();
+    const streamToName: Map<string, string> = new Map();
+    let lastActiveSpeaker = '';
+    let speakerPollTimer: ReturnType<typeof setInterval> | null = null;
+
+    // DOM lookup: find participant name for a given MediaStream
+    function lookupParticipantName(stream: MediaStream): string | null {
+      // Try to find the video element that Google Meet attached this stream to
+      const videos = Array.from(document.querySelectorAll('video'));
+      for (const video of videos) {
+        const src = (video as any).srcObject as MediaStream | null;
+        if (!src) continue;
+        // Match by stream id or by shared track id
+        const matches = src.id === stream.id ||
+          src.getTracks().some((t: MediaStreamTrack) =>
+            stream.getTracks().some((s: MediaStreamTrack) => s.id === t.id));
+        if (!matches) continue;
+
+        // Walk up the DOM to find a participant tile with a name label
+        const tile = video.closest('[data-participant-id]') || video.closest('[jsmodel]') || video.parentElement;
+        if (!tile) continue;
+
+        // Google Meet name label selectors (order of reliability)
+        const nameSelectors = [
+          '[data-display-name]',
+          '[data-self-name]',
+          '.zWGUib',
+          '.NWpY0e',
+          '[aria-label]',
+          'span[dir="auto"]',
+        ];
+        for (const sel of nameSelectors) {
+          const el = tile.querySelector(sel);
+          if (!el) continue;
+          const text = el.getAttribute('data-display-name')
+            || el.getAttribute('data-self-name')
+            || el.getAttribute('aria-label')
+            || el.textContent?.trim();
+          if (text && text.length > 0 && text.length < 60) return text;
+        }
+      }
+      return null;
+    }
+
+    function startSpeakerPolling() {
+      if (speakerPollTimer) return;
+      speakerPollTimer = setInterval(() => {
+        if (trackAnalysers.size === 0) return;
+
+        let maxEnergy = 0;
+        let loudestStreamId = '';
+        const freqBuf = new Uint8Array(64);
+
+        trackAnalysers.forEach((analyser, streamId) => {
+          analyser.getByteFrequencyData(freqBuf);
+          const energy = freqBuf.reduce((s, v) => s + v, 0) / freqBuf.length;
+          if (energy > maxEnergy) { maxEnergy = energy; loudestStreamId = streamId; }
+        });
+
+        // Only fire when there's meaningful audio energy
+        if (maxEnergy < 8 || !loudestStreamId) return;
+
+        const name = streamToName.get(loudestStreamId);
+        if (name && name !== lastActiveSpeaker) {
+          lastActiveSpeaker = name;
+          (window as any).__meetscribeActiveSpeaker(name);
+        }
+      }, 500);
+    }
+
+    function ensureAudioContext() {
+      if (audioCtx && audioCtx.state !== 'closed') return;
+      audioCtx = new AudioContext({ sampleRate: 16000 });
+      processorInput = audioCtx.createGain();
+      processor = (audioCtx as any).createScriptProcessor(4096, 1, 1);
+      processorInput.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      const actualRate = audioCtx.sampleRate;
+      console.log(`[MeetScribe] AudioContext created, sampleRate: ${actualRate}`);
+      (window as any).__meetscribeInfo(`AudioContext sampleRate=${actualRate}`);
+      // Tell audio-processor the real sample rate so Deepgram is configured correctly
+      (window as any).__meetscribeAudioConfig({ sampleRate: actualRate });
+
+      processor.onaudioprocess = (ev: any) => {
+        const data = (ev.inputBuffer as AudioBuffer).getChannelData(0);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) sumSq += data[i] * data[i];
+        const rms = Math.sqrt(sumSq / data.length);
+        const rmsDb = rms > 0 ? 20 * Math.log10(rms) : -100;
+        const int16 = new Int16Array(data.length);
+        for (let i = 0; i < data.length; i++) {
+          int16[i] = Math.max(-32768, Math.min(32767, data[i] * 32768));
+        }
+        const bytes = new Uint8Array(int16.buffer);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        (window as any).__meetscribeAudioChunk(btoa(bin), rmsDb);
+      };
+
+      audioCtx.resume().catch(() => {});
+    }
+
+    (window as any).RTCPeerConnection = function (...args: any[]) {
+      const pc = new OrigRTC(...args);
+      console.log('[MeetScribe] RTCPeerConnection created');
+      pc.addEventListener('track', (ev: RTCTrackEvent) => {
+        const t = ev.track;
+        console.log(`[MeetScribe] track event: ${t.kind} id=${t.id} muted=${t.muted}`);
+        if (t.kind !== 'audio') return;
+        ensureAudioContext();
+
+        const stream = ev.streams[0] ?? new MediaStream([t]);
+        const streamId = stream.id;
+
+        try {
+          // Main capture path: source → processorInput → ScriptProcessor → output
+          const source = audioCtx!.createMediaStreamSource(new MediaStream([t]));
+          source.connect(processorInput!);
+
+          // Parallel path: source → analyser (for energy/speaker detection only)
+          const analyser = audioCtx!.createAnalyser();
+          analyser.fftSize = 128;
+          source.connect(analyser);
+          trackAnalysers.set(streamId, analyser);
+
+          audioCtx!.resume().catch(() => {});
+          console.log('[MeetScribe] Audio track connected');
+
+          // Try to identify the participant name from DOM (retry after GM attaches stream to video)
+          const tryLookup = (delay: number) => setTimeout(() => {
+            if (!streamToName.has(streamId)) {
+              const name = lookupParticipantName(stream);
+              if (name) {
+                streamToName.set(streamId, name);
+                (window as any).__meetscribeInfo(`Stream ${streamId} → "${name}"`);
+              }
+            }
+          }, delay);
+          tryLookup(1500);
+          tryLookup(4000);
+          tryLookup(8000);
+
+          startSpeakerPolling();
+        } catch (e) {
+          console.warn('[MeetScribe] Failed to connect audio track:', e);
+        }
+      });
+      return pc;
+    };
+    Object.assign((window as any).RTCPeerConnection, OrigRTC);
+    (window as any).RTCPeerConnection.prototype = OrigRTC.prototype;
+    console.log('[MeetScribe] RTCPeerConnection interceptor installed');
+  });
+
+  log.info('Browser audio capture configured (in-browser WebRTC interception + speaker detection)');
+}
+
+// Read participant names from the Google Meet participants panel via Playwright DOM access.
+// Called after the bot is admitted — runs in the live page context.
+async function scrapeParticipantNames(page: Page): Promise<string[]> {
+  try {
+    // Try to open the participants panel
+    const peopleBtn = page.locator('[aria-label*="people" i], [data-tooltip*="people" i], [aria-label*="participants" i]').first();
+    if (await peopleBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await peopleBtn.click().catch(() => {});
+      await sleep(1500);
+    }
+
+    const names = await page.evaluate((): string[] => {
+      const found: string[] = [];
+      const seen = new Set<string>();
+
+      // Participants panel list items
+      const panelSelectors = [
+        '[data-participant-id] [data-display-name]',
+        '[data-participant-id] [data-self-name]',
+        '.cS7aqe',     // participant name in panel (historical)
+        '.zWGUib',     // name label on tile
+        '[jsname="YPqjbf"]', // name in participants list
+      ];
+
+      for (const sel of panelSelectors) {
+        document.querySelectorAll(sel).forEach(el => {
+          const name = el.getAttribute('data-display-name')
+            || el.getAttribute('data-self-name')
+            || el.textContent?.trim();
+          if (name && name.length > 0 && name.length < 60 && !seen.has(name)) {
+            seen.add(name);
+            found.push(name);
+          }
+        });
+      }
+      return found;
+    });
+
+    log.info(`[speaker] DOM scrape found participants: ${names.join(', ') || '(none)'}`);
+    return names;
+  } catch (err) {
+    log.warn('[speaker] Participant scrape failed:', (err as Error).message);
+    return [];
+  }
+}
+
+function startAudioCapture(ws: WebSocket): ChildProcess | null {
+  if (ws.readyState !== WebSocket.OPEN) {
+    log.warn('Audio WS not open — skipping audio capture');
+    return null;
+  }
+
+  // On Linux (Docker) use PulseAudio monitor; on macOS use avfoundation virtual device.
+  const isMac = process.platform === 'darwin';
+  const ffmpegArgs = isMac
+    ? [
+        '-f', 'avfoundation',
+        '-i', ':0',           // default system audio input (BlackHole or Built-in)
+        '-ar', '16000',
+        '-ac', '1',
+        '-f', 's16le',
+        '-',
+      ]
+    : [
+        '-f', 'pulse',
+        '-i', 'v1.monitor',
+        '-ar', '16000',
+        '-ac', '1',
+        '-f', 's16le',
+        '-',
+      ];
+
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+  ffmpeg.stdout!.on('data', (chunk: Buffer) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk);
+    }
+  });
+
+  ffmpeg.stderr!.on('data', (d: Buffer) => {
+    const line = d.toString().split('\n')[0];
+    if (line) log.diag('[ffmpeg]', line);
+  });
+
+  ffmpeg.on('exit', (code) => {
+    log.info(`FFmpeg exited (code=${code})`);
+  });
+
+  log.info('Audio capture started → audio-processor');
+  return ffmpeg;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cleanup
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function handleEnd(
-  browser: import('playwright').Browser,
+async function cleanup(
+  context: BrowserContext,
   ws: WebSocket,
+  ffmpeg: ChildProcess | null,
   meetingId: string,
-  ffmpeg: ReturnType<typeof spawn> | null,
-) {
-  console.log(`[meet-bot] Meeting ${meetingId} ended — cleaning up`);
+): Promise<void> {
+  log.info(`Cleaning up for meeting ${meetingId}`);
 
   if (ffmpeg) {
-    try { ffmpeg.kill('SIGINT'); } catch (_) {}
+    try { ffmpeg.kill('SIGINT'); } catch {/* ignore */}
   }
 
   if (ws.readyState === WebSocket.OPEN) {
@@ -292,319 +735,220 @@ async function handleEnd(
     ws.close();
   }
 
-  try { await browser.close(); } catch (_) {}
-  process.exit(0);
+  try { await context.close(); } catch {/* ignore */}
+
+  const prod = producer;
+  if (prod) {
+    try { await prod.disconnect(); } catch {/* ignore */}
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function main() {
-  const meetingUrl        = process.env.MEETING_URL;
-  const meetingId         = process.env.MEETING_ID;
-  const audioProcessorUrl = process.env.AUDIO_PROCESSOR_URL || 'ws://audio-processor:8001';
-  const botName           = process.env.BOT_NAME || 'AI Notetaker';
-  const MAX_KNOCK_RETRIES = 8;   // keep knocking every ~50 s for up to 8 tries
+async function main(): Promise<void> {
+  log.info(`Starting for meeting ${CONFIG.meetingId} → ${CONFIG.meetingUrl}`);
 
-  if (!meetingUrl || !meetingId) {
-    console.error('[meet-bot] Missing MEETING_URL or MEETING_ID');
-    process.exit(1);
-  }
+  // ── State machine setup ───────────────────────────────────────────────────
+  const fsm = new MeetingStateMachine(CONFIG.meetingId, MeetingState.LAUNCHING);
 
-  console.log(`[meet-bot] Starting for meeting ${meetingId} → ${meetingUrl}`);
+  fsm.onTransition(async (from, to, meetingId, meta) => {
+    // Emit Kafka event on every state transition
+    await emitKafkaEvent('bot.state_changed', { meetingId, from, to, ...(meta ?? {}) });
+  });
 
-  // ─── WebSocket to audio-processor ───────────────────────────────────────
-  const ws = new WebSocket(`${audioProcessorUrl}/ws/${meetingId}`);
+  // ── WebSocket to audio-processor ─────────────────────────────────────────
+  const ws = new WebSocket(`${CONFIG.audioProcessorUrl}/ws/${CONFIG.meetingId}`);
   let wsReady = false;
 
   ws.on('open', () => {
     wsReady = true;
-    console.log('[meet-bot] Audio processor WebSocket connected');
+    log.info('Audio processor WebSocket connected');
   });
-  ws.on('error', (err) => {
-    console.warn('[meet-bot] Audio processor WS error (continuing):', err.message);
-  });
+  ws.on('error', (err) => log.warn('Audio WS error (continuing):', err.message));
 
-  // ─── Launch Chrome ──────────────────────────────────────────────────────
-  const browser = await chromium.launch({
-    channel: 'chrome',
-    headless: false,                       // required for Xvfb inside Docker
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--use-fake-ui-for-media-stream',    // auto-grant mic/cam
-      '--use-fake-device-for-media-stream',
-      '--disable-infobars',
-      '--window-size=1280,720',
-      '--disable-blink-features=AutomationControlled',
-    ],
-    ignoreDefaultArgs: ['--enable-automation'],
-  });
-
-  let admitted = false;
-  let currentContext: BrowserContext | undefined;
-  let page!: Page;
-
-  for (let attempt = 1; attempt <= MAX_KNOCK_RETRIES; attempt++) {
-    console.log(`[meet-bot] Knock attempt ${attempt}/${MAX_KNOCK_RETRIES}`);
-
-    // Close previous page and context if they exist to start completely fresh
-    if (page) {
-      try { await page.close(); } catch (_) {}
-    }
-    if (currentContext) {
-      try { await currentContext.close(); } catch (_) {}
-    }
-
-    currentContext = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'sec-ch-ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-ch-ua-platform-version': '"10.0.0"',
-        'sec-ch-ua-arch': '"x86"',
-        'sec-ch-ua-bitness': '"64"',
-        'sec-ch-ua-model': '""',
-      },
+  // ── Launch Chromium with persistent profile (signed-in as riteshmeetscribe@gmail.com) ──
+  let context: BrowserContext;
+  try {
+    context = await chromium.launchPersistentContext(CONFIG.profileDir, {
+      headless: false,
+      ignoreDefaultArgs: ['--enable-automation', '--disable-sync', '--disable-background-networking'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
+        '--disable-infobars',
+        '--disable-blink-features=AutomationControlled',
+        '--autoplay-policy=no-user-gesture-required',
+        '--window-size=1280,720',
+      ],
       permissions: ['microphone', 'camera'],
       locale: 'en-US',
       viewport: { width: 1280, height: 720 },
-      screen: { width: 1920, height: 1080 }, // Emulate a screen size larger than viewport
-      deviceScaleFactor: 1,
     });
-
-    // Inject Google authentication cookies if provided
-    const cookiesJson = process.env.GOOGLE_COOKIES_JSON;
-    if (cookiesJson && cookiesJson.trim() !== '') {
-      try {
-        const cookies = JSON.parse(cookiesJson);
-        if (Array.isArray(cookies)) {
-          const formattedCookies = cookies.map((c: any) => {
-            let sameSite = 'Lax';
-            if (c.sameSite) {
-              const s = c.sameSite.toLowerCase();
-              if (s === 'no_restriction' || s === 'none') {
-                sameSite = 'None';
-              } else if (s === 'lax') {
-                sameSite = 'Lax';
-              } else if (s === 'strict') {
-                sameSite = 'Strict';
-              }
-            }
-            return {
-              name: c.name,
-              value: c.value,
-              domain: c.domain.startsWith('.') ? c.domain : `.${c.domain}`,
-              path: c.path || '/',
-              secure: c.secure !== undefined ? c.secure : true,
-              httpOnly: c.httpOnly !== undefined ? c.httpOnly : true,
-              sameSite: sameSite as any,
-            };
-          });
-          await currentContext.addCookies(formattedCookies);
-          console.log('[meet-bot] Successfully injected Google cookies for signed-in session');
-        }
-      } catch (cookieErr: any) {
-        console.error('[meet-bot] Failed to parse GOOGLE_COOKIES_JSON:', cookieErr.message);
-      }
-    }
-
-    // Add init script to spoof platform and userAgentData to bypass Google Meet bot detection
-    await currentContext.addInitScript(() => {
-      Object.defineProperty(navigator, 'platform', {
-        get: () => 'Win32',
-      });
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => false,
-      });
-      Object.defineProperty(navigator, 'hardwareConcurrency', {
-        get: () => 8,
-      });
-      Object.defineProperty(navigator, 'deviceMemory', {
-        get: () => 8,
-      });
-
-      // Spoof WebGL vendor and renderer (so Google Meet doesn't see a headless/virtualized GPU)
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(parameter: number) {
-        if (parameter === 37445) {
-          return 'Intel Inc.';
-        }
-        if (parameter === 37446) {
-          return 'Intel(R) Iris(TM) Plus Graphics 640';
-        }
-        return getParameter.apply(this, [parameter]);
-      };
-
-      const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-      if (getParameter2) {
-        WebGL2RenderingContext.prototype.getParameter = function(parameter: number) {
-          if (parameter === 37445) {
-            return 'Intel Inc.';
-          }
-          if (parameter === 37446) {
-            return 'Intel(R) Iris(TM) Plus Graphics 640';
-          }
-          return getParameter2.apply(this, [parameter]);
-        };
-      }
-
-      // Mock navigator.userAgentData
-      const uaData = {
-        brands: [
-          { brand: 'Not/A)Brand', version: '8' },
-          { brand: 'Chromium', version: '125' },
-          { brand: 'Google Chrome', version: '125' },
-        ],
-        mobile: false,
-        platform: 'Windows',
-        getHighEntropyValues: async (hints: string[]) => {
-          const values: any = {
-            brands: [
-              { brand: 'Not/A)Brand', version: '8' },
-              { brand: 'Chromium', version: '125' },
-              { brand: 'Google Chrome', version: '125' },
-            ],
-            mobile: false,
-            platform: 'Windows',
-            platformVersion: '10.0.0',
-            architecture: 'x86',
-            model: '',
-            bitness: '64',
-            uaFullVersion: '125.0.0.0',
-            fullVersionList: [
-              { brand: 'Not/A)Brand', version: '8' },
-              { brand: 'Chromium', version: '125' },
-              { brand: 'Google Chrome', version: '125' },
-            ],
-          };
-          const result: any = {};
-          for (const hint of hints) {
-            if (hint in values) {
-              result[hint] = values[hint];
-            }
-          }
-          return result;
-        },
-      };
-      Object.defineProperty(navigator, 'userAgentData', {
-        get: () => uaData,
-      });
-
-      // Mock chrome object
-      (window as any).chrome = {
-        app: {
-          isInstalled: false,
-          InstallState: {
-            DISABLED: 'disabled',
-            INSTALLED: 'installed',
-            NOT_INSTALLED: 'not_installed',
-          },
-          RunningState: {
-            CANNOT_RUN: 'cannot_run',
-            READY_TO_RUN: 'ready_to_run',
-            RUNNING: 'running',
-          },
-        },
-        runtime: {},
-      };
+  } catch (err) {
+    log.error('Failed to launch browser:', (err as Error).message);
+    await emitKafkaEvent('bot.failed', {
+      meetingId: CONFIG.meetingId,
+      reason: JoinFailureReason.NETWORK_ERROR,
     });
-
-    page = await currentContext.newPage();
-    page.on('dialog', async (dialog) => { await dialog.accept(); });
-
-    // Navigate to meeting
-    try {
-      await page.goto(meetingUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch (err) {
-      console.error('[meet-bot] Navigation failed:', (err as Error).message);
-      await sleep(5000);
-      continue;
-    }
-
-    console.log(`[meet-bot] Attempt ${attempt} — landed on: ${page.url()}`);
-
-    // If Google redirected to sign-in, try to navigate back as guest
-    if (isSignInPage(page.url())) {
-      console.log('[meet-bot] Redirected to sign-in page — navigating back as guest');
-      try {
-        await page.goto(meetingUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await sleep(2000);
-      } catch (_) {}
-
-      if (isSignInPage(page.url())) {
-        console.error('[meet-bot] Still on sign-in after retry. Meeting may require a signed-in account. Exiting.');
-        await saveScreenshot(page, 'screenshot-signin-blocked.png');
-        await browser.close();
-        process.exit(1);
-      }
-    }
-
-    // Wait for lobby to be interactive
-    await sleep(2500);
-
-    // Dismiss "Sign in – Got it" tooltip and any other popups
-    await dismissAllPopups(page);
-    await sleep(500);
-
-    // Dismiss any pre-join mic/camera dialogs
-    try {
-      const turnOff = page.getByRole('button', { name: /turn off microphone/i });
-      if (await turnOff.isVisible({ timeout: 2000 })) {
-        await turnOff.click();
-        console.log('[meet-bot] Dismissed microphone dialog');
-      }
-    } catch (_) {}
-
-    // Enter bot name
-    await enterBotName(page, botName);
-    await sleep(1500);
-
-    // Dismiss popups again (they sometimes re-appear after interacting with the form)
-    await dismissAllPopups(page);
-    await sleep(1000);
-
-    // Click Ask to join
-    const clicked = await clickJoinButton(page);
-    if (!clicked) {
-      await saveScreenshot(page, `screenshot-no-join-btn-attempt${attempt}.png`);
-      await sleep(3000);
-      continue;
-    }
-
-    // Wait to be admitted (90 s window per attempt)
-    admitted = await waitUntilAdmitted(page, 90000);
-
-    if (admitted) {
-      console.log(`[meet-bot] Admitted to meeting on attempt ${attempt} ✅`);
-      break;
-    }
-
-    console.log(`[meet-bot] Not admitted on attempt ${attempt}. URL: ${page.url()} — waiting 20 s before re-knock...`);
-    await saveScreenshot(page, `screenshot-knock-attempt${attempt}.png`);
-    await sleep(20000);
-  }
-
-  if (!admitted) {
-    console.error('[meet-bot] Exhausted all knock attempts. Giving up.');
-    await saveScreenshot(page, 'screenshot-exhausted.png');
-    await browser.close();
-    // Still emit meeting_ended so audio-processor/summarizer clean up
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ event: 'meeting_ended', meetingId }));
-      ws.close();
-    }
     process.exit(1);
   }
 
-  // ─── Start audio capture ─────────────────────────────────────────────────
-  let ffmpeg: ReturnType<typeof spawn> | null = null;
+  const classifier = new FailureClassifier();
+  let ffmpeg: ChildProcess | null = null;
+  let ended = false;
 
+  const handleSignal = async () => {
+    if (ended) return;
+    ended = true;
+    log.info('Received shutdown signal');
+    await cleanup(context, ws, ffmpeg, CONFIG.meetingId);
+    process.exit(0);
+  };
+  process.once('SIGTERM', handleSignal);
+  process.once('SIGINT', handleSignal);
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+  });
+
+  await setupBrowserAudioCapture(context, ws);
+
+  // ── Inject cookies.json (cross-platform: macOS profile cookies won't decrypt on Linux) ──
+  const cookiesPath = path.join(CONFIG.profileDir, 'cookies.json');
+  if (fs.existsSync(cookiesPath)) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(cookiesPath, 'utf8'));
+      await context.addCookies(saved);
+      log.info(`Injected ${saved.length} cookies from cookies.json`);
+    } catch (err) {
+      log.warn('Failed to inject cookies.json:', (err as Error).message);
+    }
+  } else {
+    log.warn('No cookies.json — bot will join as guest (may be blocked by Google)');
+  }
+
+  // ── Navigate to meeting ───────────────────────────────────────────────────
+  await fsm.transition(MeetingState.NAVIGATING);
+
+  const page = await context.newPage();
+  page.on('dialog', async (d) => d.accept().catch(() => {}));
+  page.on('console', (msg) => {
+    const text = msg.text();
+    if (text.startsWith('[MeetScribe]')) log.info(`[browser] ${text}`);
+  });
+  classifier.attachToPage(page);
+
+  log.info(`Navigating to meeting: ${CONFIG.meetingUrl}`);
+
+  try {
+    await page.goto(CONFIG.meetingUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: CONFIG.navTimeoutMs,
+    });
+  } catch (err) {
+    log.error('Navigation to meeting URL failed:', (err as Error).message);
+    await saveDiagnostics(page, 'nav-failed');
+    await fsm.transition(MeetingState.NETWORK_ERROR, { error: (err as Error).message });
+    await cleanup(context, ws, ffmpeg, CONFIG.meetingId);
+    process.exit(1);
+  }
+
+  log.info(`Post-navigation URL: ${page.url()}`);
+  await saveDiagnostics(page, 'post-navigation');
+
+  // ── Pre-join lobby ────────────────────────────────────────────────────────
+  await fsm.transition(MeetingState.LOBBY);
+
+  // Wait for Meet's React bundle to render the lobby UI.
+  // The join button is rendered by JavaScript — domcontentloaded fires before it exists.
+  log.info('Waiting for Meet lobby to render…');
+  await sleep(4000);
+
+  const lobbyUrl = page.url();
+  const lobbyTitle = await page.title().catch(() => '');
+  log.info(`Lobby URL: ${lobbyUrl}`);
+  log.info(`Lobby title: ${lobbyTitle}`);
+  await saveDiagnostics(page, 'lobby-loaded');
+
+  // Detect instant block (unauthenticated or domain-restricted) before trying to join
+  if (!lobbyUrl.includes('meet.google.com')) {
+    log.error(`Meet redirected away from meeting URL: ${lobbyUrl}`);
+    await fsm.transition(MeetingState.FAILED, { reason: 'redirected_from_meet', url: lobbyUrl });
+    await cleanup(context, ws, ffmpeg, CONFIG.meetingId);
+    process.exit(1);
+  }
+
+  for (let i = 0; i < 3; i++) {
+    await dismissPopups(page);
+    await sleep(400);
+  }
+
+  // Dismiss microphone/camera permission dialogs if they appear
+  try {
+    const micDialog = page.getByRole('button', { name: /turn off microphone/i });
+    if (await micDialog.isVisible({ timeout: 2000 })) {
+      await micDialog.click();
+      log.info('Dismissed microphone dialog');
+    }
+  } catch { /* ignore */ }
+
+  // ── Click join (with retry) ───────────────────────────────────────────────
+  await fsm.transition(MeetingState.WAITING_APPROVAL);
+  classifier.markJoinClicked();
+
+  const clicked = await clickJoinWithRetry(page, 3, 4000);
+  if (!clicked) {
+    log.error('Could not find or click join button after 3 attempts');
+    await fsm.transition(MeetingState.FAILED, { reason: 'join_button_not_found' });
+    await cleanup(context, ws, ffmpeg, CONFIG.meetingId);
+    process.exit(1);
+  }
+
+  // ── Wait for admission ────────────────────────────────────────────────────
+  const { admitted, failureReason } = await waitUntilAdmitted(page, classifier);
+
+  if (!admitted) {
+    const reason = failureReason ?? JoinFailureReason.UNKNOWN;
+    const targetState = FAILURE_TO_STATE[reason];
+    log.error(`Not admitted — ${reason}: ${FailureClassifier.describe(reason)}`);
+    await fsm.tryTransition(targetState, { reason });
+    await emitKafkaEvent('bot.join_failed', {
+      meetingId: CONFIG.meetingId,
+      reason,
+      description: FailureClassifier.describe(reason),
+    });
+    await cleanup(context, ws, ffmpeg, CONFIG.meetingId);
+
+    process.exit(1);
+  }
+
+  // ── Inside the meeting ────────────────────────────────────────────────────
+  await fsm.transition(MeetingState.JOINED);
+  await emitKafkaEvent('meeting.joined', {
+    meetingId: CONFIG.meetingId,
+  });
+
+  // Scrape participant names from DOM (non-blocking — runs after 3s to let the UI settle)
+  sleep(3000).then(async () => {
+    const names = await scrapeParticipantNames(page);
+    if (names.length > 0 && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'participant_names', names }));
+    }
+    // Re-scrape after 15s to catch late joiners
+    await sleep(15000);
+    const names2 = await scrapeParticipantNames(page);
+    if (names2.length > 0 && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'participant_names', names: names2 }));
+    }
+  }).catch(() => {});
+
+  // ── Start audio capture ───────────────────────────────────────────────────
   // Wait for WS if still connecting
   if (!wsReady && ws.readyState === WebSocket.CONNECTING) {
     await new Promise<void>((resolve) => {
@@ -614,112 +958,106 @@ async function main() {
     });
   }
 
-  if (ws.readyState === WebSocket.OPEN) {
-    ffmpeg = spawn('ffmpeg', [
-      '-f', 'pulse',
-      '-i', 'v1.monitor',
-      '-ar', '16000',
-      '-ac', '1',
-      '-f', 's16le',
-      '-',
-    ]);
+  // Browser WebRTC interception captures real participant audio on all platforms.
+  // ffmpeg/PulseAudio is disabled — it would send silence on Docker and corrupt
+  // the audio stream by mixing two sources into the same WebSocket connection.
+  log.info('Audio captured in-browser via WebRTC interception (all platforms)');
+  await fsm.transition(MeetingState.RECORDING);
 
-    ffmpeg.stdout!.on('data', (data: Buffer) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
-      }
-    });
-
-    ffmpeg.stderr!.on('data', (d: Buffer) => {
-      const line = d.toString().split('\n')[0];
-      if (line) console.log('[ffmpeg]', line);
-    });
-
-    console.log('[meet-bot] Audio capture started → audio processor');
-  } else {
-    console.warn('[meet-bot] Audio WS not open — skipping audio capture');
-  }
-
-  // ─── Monitor meeting for end ─────────────────────────────────────────────
+  // ── Monitor meeting for end ───────────────────────────────────────────────
   let aloneCount = 0;
-  let ended = false;
+
+  const callEndedTexts = [
+    "You've left the meeting",
+    'This call has ended',
+    'You were removed from the meeting',
+    'The video call ended',
+  ];
 
   const checkInterval = setInterval(async () => {
     if (ended) return;
     try {
       const url = page.url();
 
-      // If redirected away from a meeting URL, the meeting ended
+      // Navigated away from Meet — call has ended
       if (!url.includes('meet.google.com')) {
         ended = true;
         clearInterval(checkInterval);
-        await handleEnd(browser, ws, meetingId, ffmpeg);
+        await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
         return;
       }
 
-      // Check for "call ended" pages
-      const callEndedTexts = [
-        "You've left the meeting",
-        'This call has ended',
-        'You were removed from the meeting',
-        'The video call ended',
-      ];
+      // Explicit "call ended" text
       for (const text of callEndedTexts) {
-        const visible = await page.locator(`text=${JSON.stringify(text)}`).isVisible().catch(() => false);
-        if (visible) {
-          console.log(`[meet-bot] Detected call end: "${text}"`);
+        if (await page.locator(`text=${JSON.stringify(text)}`).isVisible().catch(() => false)) {
+          log.info(`Call end detected: "${text}"`);
           ended = true;
           clearInterval(checkInterval);
-          await handleEnd(browser, ws, meetingId, ffmpeg);
+          await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
           return;
         }
       }
 
-      // Check leave button still present
+      // Leave button disappeared
       const leaveVisible =
         await page.isVisible('[aria-label="Leave call"]').catch(() => false) ||
         await page.isVisible('[data-tooltip="Leave call"]').catch(() => false);
 
       if (!leaveVisible) {
-        console.log('[meet-bot] Leave button disappeared — meeting likely ended');
+        log.info('Leave button gone — meeting likely ended');
         ended = true;
         clearInterval(checkInterval);
         await sleep(3000);
-        await handleEnd(browser, ws, meetingId, ffmpeg);
+        await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
         return;
       }
 
-      // Auto-leave when alone
+      // Alone-detection: auto-leave if only participant
       const count = await getParticipantCount(page);
-      console.log(`[meet-bot] Participant count: ${count}`);
+      log.info(`Participant count: ${count}`);
       if (count === 1) {
         aloneCount++;
-        if (aloneCount >= 4) {    // alone for 12 s (4 * 3s)
-          console.log('[meet-bot] Alone in meeting for 12 s — leaving');
+        if (aloneCount >= CONFIG.aloneCountThreshold) {
+          log.info(`Alone for ${CONFIG.aloneCountThreshold} checks — leaving`);
           ended = true;
           clearInterval(checkInterval);
-          await handleEnd(browser, ws, meetingId, ffmpeg);
+          await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
         }
       } else {
         aloneCount = 0;
       }
-    } catch (_) {
-      ended = true;
-      clearInterval(checkInterval);
-      await handleEnd(browser, ws, meetingId, ffmpeg);
+    } catch {
+      if (!ended) {
+        ended = true;
+        clearInterval(checkInterval);
+        await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
+      }
     }
-  }, 3000);
+  }, CONFIG.meetingCheckIntervalMs);
 
-  // Also watch page navigation events
+  // Watch frame navigation (immediate detection)
   page.on('framenavigated', async (frame) => {
     if (ended || frame !== page.mainFrame()) return;
-    const url = frame.url();
-    if (!url.includes('meet.google.com')) {
+    if (!frame.url().includes('meet.google.com')) {
       ended = true;
       clearInterval(checkInterval);
-      await handleEnd(browser, ws, meetingId, ffmpeg);
+      await handleMeetingEnd(fsm, context, ws, ffmpeg, CONFIG.meetingId);
     }
   });
+}
+
+async function handleMeetingEnd(
+  fsm: MeetingStateMachine,
+  context: BrowserContext,
+  ws: WebSocket,
+  ffmpeg: ChildProcess | null,
+  meetingId: string,
+): Promise<void> {
+  log.info(`Meeting ${meetingId} ended — cleaning up`);
+  await fsm.tryTransition(MeetingState.PROCESSING);
+  await emitKafkaEvent('meeting.ended', { meetingId });
+  await cleanup(context, ws, ffmpeg, meetingId);
+  process.exit(0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -727,6 +1065,6 @@ async function main() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 main().catch((err) => {
-  console.error('[meet-bot] Fatal error:', err);
+  log.error('Fatal error:', err);
   process.exit(1);
 });

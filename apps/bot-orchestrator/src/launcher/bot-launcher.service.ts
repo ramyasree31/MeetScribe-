@@ -1,9 +1,10 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { Kafka, Consumer } from 'kafkajs';
-import * as Docker from 'dockerode';
+import Docker = require('dockerode');
 import { PrismaClient } from '@prisma/client';
 import { spawn } from 'child_process';
 import * as path from 'path';
+import { releaseBotAccount } from '@meetscribe/bot-pool';
 
 interface DispatchBotPayload {
   meetingId: string;
@@ -48,7 +49,7 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     try {
       await this.consumer.connect();
-      await this.consumer.subscribe({ topic: 'dispatch.bot', fromBeginning: true });
+      await this.consumer.subscribe({ topic: 'dispatch.bot', fromBeginning: false });
 
       await this.consumer.run({
         eachMessage: async ({ message }) => {
@@ -82,6 +83,18 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`Launching ${platform} bot for meeting ${meetingId}`);
 
+    const meeting = await this.prisma.meeting.findUnique({
+      where: { id: meetingId },
+      include: { botAccount: true },
+    });
+
+    // Skip stale Kafka messages for meetings already in a terminal or active state
+    const skipStatuses = ['FAILED', 'ERROR', 'LIVE', 'FINISHED', 'CANCELLED'];
+    if (meeting && skipStatuses.includes(meeting.status)) {
+      this.logger.warn(`Skipping stale dispatch for meeting ${meetingId} (status: ${meeting.status})`);
+      return;
+    }
+
     const BOT_IMAGE = process.env.BOT_WORKER_IMAGE || 'meetscribe/bot-worker:latest';
 
     const env: string[] = [
@@ -90,18 +103,21 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
       `PLATFORM=${platform}`,
       `AUDIO_PROCESSOR_URL=${process.env.AUDIO_PROCESSOR_URL || 'ws://audio-processor:8001'}`,
       `BOT_TOKEN=${botToken}`,
-      // Bot-worker containers must use the internal Kafka listener (kafka:29092)
-      // because 'localhost:9092' doesn't resolve inside a Docker container
       `KAFKA_BROKERS=${process.env.BOT_KAFKA_BROKERS || 'kafka:29092'}`,
-      // Google Meet auth — pass cookie JSON through to bot container
-      // Leave empty for guest-only mode; set to a JSON cookie array for authenticated joins
-      `GOOGLE_COOKIES_JSON=${process.env.GOOGLE_COOKIES_JSON || ''}`,
-      // Display name the bot uses in the meeting lobby
       `BOT_NAME=${process.env.BOT_NAME || 'AI Notetaker'}`,
+      `BOT_PROFILE_DIR=/app/profiles/bot001-fresh`,
     ];
 
     if (zoomPasscode) {
       env.push(`ZOOM_PASSCODE=${zoomPasscode}`);
+    }
+
+    // SKIP_DOCKER=true → run bot as local process instead of Docker container
+    const skipDocker = process.env.SKIP_DOCKER === 'true';
+    if (skipDocker) {
+      this.logger.log(`SKIP_DOCKER=true — running bot locally (no Docker)`);
+      await this.runLocalBot(payload, meeting);
+      return;
     }
 
     try {
@@ -111,6 +127,7 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
         this.logger.log(`Removed existing container bot-${meetingId} before recreating`);
       } catch (_) {}
 
+      // Bind-mount the host profiles directory so the container can access
       const container = await this.docker.createContainer({
         Image: BOT_IMAGE,
         name: `bot-${meetingId}`,
@@ -123,6 +140,7 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
           NetworkMode: process.env.DOCKER_NETWORK || 'meetingbot_default',
           // Shared memory size for Chromium
           ShmSize: 256 * 1024 * 1024, // 256MB
+          Binds: [`${process.env.BOT_PROFILES_BASE_DIR || '/profiles'}:/app/profiles`],
         },
       });
 
@@ -157,9 +175,11 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`Failed to launch container for meeting ${meetingId}: ${err.message}. Trying local fallback...`);
 
       try {
-        const botWorkerDir = path.resolve(__dirname, '../../../../bot-worker');
-        const isWindows = process.platform === 'win32';
-        const cmd = isWindows ? 'npx.cmd' : 'npx';
+        // __dirname is src/launcher (dev) or dist/launcher (prod).
+        // Either way, 3 levels up reaches apps/, then bot-worker is a sibling.
+        const botWorkerDir = path.resolve(__dirname, '../../../bot-worker');
+        // Use node with compiled dist — avoids ts-node ESM conflicts in src/
+        const cmd = process.execPath; // same node binary that is running this process
 
         const localEnv: any = {
           ...process.env,
@@ -169,17 +189,16 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
           AUDIO_PROCESSOR_URL: 'ws://localhost:8001',
           BOT_TOKEN: botToken,
           KAFKA_BROKERS: process.env.KAFKA_BROKERS || 'localhost:9092',
-          GOOGLE_COOKIES_JSON: process.env.GOOGLE_COOKIES_JSON || '',
           BOT_NAME: process.env.BOT_NAME || 'AI Notetaker',
         };
         if (zoomPasscode) {
           localEnv.ZOOM_PASSCODE = zoomPasscode;
         }
 
-        const child = spawn(cmd, ['ts-node', 'src/index.ts'], {
+        const child = spawn(cmd, ['dist/index.js'], {
           cwd: botWorkerDir,
           env: localEnv,
-          shell: isWindows,
+          shell: false,
         });
 
         child.on('error', (err) => {
@@ -208,6 +227,16 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
               where: { id: meetingId },
               data: { status: 'FAILED' },
             }).catch(() => {});
+          }
+
+          // Release the bot account if allocated
+          if (meeting?.botAccountId) {
+            await releaseBotAccount(meeting.botAccountId, {
+              failed: code !== 0,
+              sessionExpired: code === 2,
+            }).catch((releaseErr) => {
+              this.logger.error(`Failed to release bot account: ${releaseErr.message}`);
+            });
           }
         });
 
@@ -238,11 +267,11 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
           create: {
             meetingId,
             status: 'ERROR',
-            errorMsg: `Docker: ${err.message}. Local: ${fallbackErr.message}`,
+            failureReason: `Docker: ${err.message}. Local: ${fallbackErr.message}`,
           },
           update: {
             status: 'ERROR',
-            errorMsg: `Docker: ${err.message}. Local: ${fallbackErr.message}`,
+            failureReason: `Docker: ${err.message}. Local: ${fallbackErr.message}`,
           },
         }).catch(() => {});
 
@@ -252,6 +281,80 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
         }).catch(() => {});
       }
     }
+  }
+
+  async runLocalBot(
+    payload: DispatchBotPayload,
+    meeting: any,
+  ) {
+    const { meetingId, meetingUrl, botToken, zoomPasscode } = payload;
+    const platform = payload.platform?.toUpperCase() || detectPlatform(meetingUrl);
+
+    const botWorkerDir = path.resolve(__dirname, '../../../bot-worker');
+    const cmd = process.execPath;
+
+    const localEnv: any = {
+      ...process.env,
+      MEETING_ID: meetingId,
+      MEETING_URL: meetingUrl,
+      PLATFORM: platform,
+      AUDIO_PROCESSOR_URL: 'ws://localhost:8001',
+      BOT_TOKEN: botToken,
+      KAFKA_BROKERS: process.env.KAFKA_BROKERS || 'localhost:9092',
+      BOT_NAME: process.env.BOT_NAME || 'AI Notetaker',
+    };
+    if (zoomPasscode) {
+      localEnv.ZOOM_PASSCODE = zoomPasscode;
+    }
+
+    const child = spawn(cmd, ['dist/index.js'], {
+      cwd: botWorkerDir,
+      env: localEnv,
+      shell: false,
+    });
+
+    child.on('error', (err) => {
+      this.logger.error(`Failed to spawn local bot worker: ${err.message}`);
+    });
+    child.stdout?.on('data', (data) => {
+      this.logger.log(`[local-bot] ${data.toString().trim()}`);
+    });
+    child.stderr?.on('data', (data) => {
+      this.logger.error(`[local-bot-err] ${data.toString().trim()}`);
+    });
+    child.on('close', async (code) => {
+      this.logger.log(`Local bot exited with code ${code}`);
+      const finalStatus = code === 0 ? 'FINISHED' : 'ERROR';
+      await this.prisma.bot.upsert({
+        where: { meetingId },
+        create: { meetingId, status: finalStatus },
+        update: { status: finalStatus },
+      }).catch(() => {});
+      if (code !== 0) {
+        await this.prisma.meeting.update({
+          where: { id: meetingId },
+          data: { status: 'FAILED' },
+        }).catch(() => {});
+      }
+      if (meeting?.botAccountId) {
+        await releaseBotAccount(meeting.botAccountId, {
+          failed: code !== 0,
+          sessionExpired: code === 2,
+        }).catch(() => {});
+      }
+    });
+
+    await this.prisma.bot.upsert({
+      where: { meetingId },
+      create: { meetingId, status: 'JOINING', containerId: 'local-process' },
+      update: { status: 'JOINING', containerId: 'local-process' },
+    });
+    await this.prisma.meeting.update({
+      where: { id: meetingId },
+      data: { status: 'LIVE' },
+    });
+
+    this.logger.log(`Local bot process spawned for meeting ${meetingId}`);
   }
 
   private watchContainer(container: Docker.Container, meetingId: string) {
@@ -297,11 +400,11 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
         create: {
           meetingId,
           status: finalStatus,
-          ...(errorMsg ? { errorMsg } : {}),
+          ...(errorMsg ? { failureReason: errorMsg } : {}),
         },
         update: {
           status: finalStatus,
-          ...(errorMsg ? { errorMsg } : {}),
+          ...(errorMsg ? { failureReason: errorMsg } : {}),
         },
       }).catch(() => {});
 
@@ -310,6 +413,19 @@ export class BotLauncherService implements OnModuleInit, OnModuleDestroy {
           where: { id: meetingId },
           data: { status: 'FAILED' },
         }).catch(() => {});
+      }
+
+      // Query meeting to release bot account
+      const meeting = await this.prisma.meeting.findUnique({
+        where: { id: meetingId },
+      });
+      if (meeting && meeting.botAccountId) {
+        await releaseBotAccount(meeting.botAccountId, {
+          failed: StatusCode !== 0,
+          sessionExpired: StatusCode === 2,
+        }).catch((releaseErr) => {
+          this.logger.error(`Failed to release bot account: ${releaseErr.message}`);
+        });
       }
     }).catch((err) => {
       this.logger.error(`Error watching container for meeting ${meetingId}`, err);

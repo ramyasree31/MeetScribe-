@@ -7,25 +7,42 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─────────────────────────────────────────────
-// Auth / Users
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth / Identity
+// ─────────────────────────────────────────────────────────────────────────────
 
 model User {
-  id          String    @id @default(cuid())
-  supabaseId  String    @unique
-  email       String    @unique
-  name        String?
-  avatarUrl   String?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  meetings    Meeting[]
-  memberships WorkspaceMember[]
+  id             String          @id @default(cuid())
+  supabaseId     String          @unique
+  email          String          @unique
+  name           String?
+  avatarUrl      String?
+  orgId          String?
+  org            Organization?   @relation(fields: [orgId], references: [id])
+  oauthTokens    OAuthToken[]
+  meetings       Meeting[]
+  memberships    WorkspaceMember[]
+  calendarEvents CalendarEvent[]
+  calendarWatch  CalendarWatch?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([orgId])
 }
 
-// ─────────────────────────────────────────────
-// Workspaces (for team email notifications)
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Organizations (multi-tenant)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  domain    String?  @unique  // e.g. "acme.com" — used for Workspace policy checks
+  plan      String   @default("free")  // "free" | "pro" | "enterprise"
+  users     User[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
 
 model Workspace {
   id        String            @id @default(cuid())
@@ -41,84 +58,206 @@ model WorkspaceMember {
   workspace   Workspace @relation(fields: [workspaceId], references: [id])
   userId      String
   user        User      @relation(fields: [userId], references: [id])
-  role        String    @default("member") // "owner", "member"
+  role        String    @default("member")  // "owner" | "admin" | "member"
   createdAt   DateTime  @default(now())
 
   @@unique([workspaceId, userId])
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OAuth Tokens (Google Calendar / Drive access)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OAuthToken {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  provider     String   // "google"
+  /// AES-256-GCM encrypted access token
+  accessToken  String
+  /// AES-256-GCM encrypted refresh token
+  refreshToken String
+  expiresAt    DateTime
+  scopes       String[] // e.g. ["openid", "email", "https://www.googleapis.com/auth/calendar.readonly"]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bot Accounts (dedicated Gmail accounts used by the bot fleet)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model BotAccount {
+  id                  String    @id @default(cuid())
+  email               String    @unique  // e.g. meetingbot001@gmail.com
+  /// Filesystem path to the Chromium persistent profile directory
+  profilePath         String
+  status              String    @default("AVAILABLE")
+  // AVAILABLE | BUSY | SESSION_EXPIRED | LOCKED | COOLDOWN | RETIRED
+  lastUsedAt          DateTime?
+  /// Timestamp of the last successful session validation
+  sessionValidAt      DateTime?
+  /// If COOLDOWN: do not allocate until this time
+  cooldownUntil       DateTime?
+  /// Reset to 0 on successful join; incremented on failure
+  consecutiveFailures Int       @default(0)
+  meetings            Meeting[]
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Google Calendar Integration
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CalendarEvent {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id])
+  /// Google Calendar event ID
+  googleEventId    String
+  title            String
+  startTime        DateTime
+  endTime          DateTime
+  meetingUrl       String?
+  platform         String?   // "MEET" | "ZOOM" | "TEAMS" | null
+  /// "confirmed" | "cancelled" | "tentative"
+  status           String
+  isRecurring      Boolean   @default(false)
+  recurringEventId String?
+  /// Full raw Google Calendar event payload for debugging
+  raw              Json
+  meetingId        String?
+  meeting          Meeting?  @relation(fields: [meetingId], references: [id])
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@unique([userId, googleEventId])
+  @@index([userId, startTime])
+  @@index([userId, status])
+}
+
+/// Google Calendar push notification watch channel
+model CalendarWatch {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id])
+  channelId  String   @unique
+  resourceId String
+  syncToken  String?
+  expiration DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([expiration])  // For renewal cron
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Meetings
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 model Meeting {
-  id          String    @id @default(cuid())
-  title       String
-  platform    String    // "MEET" | "ZOOM" | "TEAMS"
-  meetingUrl  String
-  status      String    @default("SCHEDULED")
-  // SCHEDULED → JOINING → RECORDING → PROCESSING → COMPLETED | FAILED
-  startTime   DateTime?
-  endTime     DateTime?
-  userId      String
-  user        User      @relation(fields: [userId], references: [id])
-  workspaceId String?
-  workspace   Workspace? @relation(fields: [workspaceId], references: [id])
-  transcript  Transcript?
-  summary     Summary?
-  actionItems ActionItem[]
-  bot         Bot?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id           String          @id @default(cuid())
+  title        String
+  platform     String          // "MEET" | "ZOOM" | "TEAMS"
+  meetingUrl   String
+  status       String          @default("SCHEDULED")
+  // SCHEDULED → ASSIGNED → LAUNCHING → AUTHENTICATING → NAVIGATING →
+  // LOBBY → WAITING_APPROVAL → JOINED → RECORDING → PROCESSING → COMPLETED
+  // or: REJECTED | DOMAIN_RESTRICTED | SESSION_EXPIRED | BOT_LOCKED |
+  //     RATE_LIMITED | NETWORK_ERROR | FAILED
+  startTime    DateTime?
+  endTime      DateTime?
+  userId       String
+  user         User            @relation(fields: [userId], references: [id])
+  workspaceId  String?
+  workspace    Workspace?      @relation(fields: [workspaceId], references: [id])
+  botAccountId String?
+  botAccount   BotAccount?     @relation(fields: [botAccountId], references: [id])
+  transcript   Transcript?
+  chunks       TranscriptChunk[]
+  summary      Summary?
+  actionItems  ActionItem[]
+  bot          Bot?
+  calendarEvents CalendarEvent[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([userId, status])
+  @@index([status, startTime])  // Scheduler query: find upcoming meetings
+  @@index([botAccountId])
 }
 
-// ─────────────────────────────────────────────
-// Bot Worker Instances
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Bot Worker Instance (tracks Docker container)
+// ─────────────────────────────────────────────────────────────────────────────
 
 model Bot {
-  id          String   @id @default(cuid())
-  meetingId   String   @unique
-  meeting     Meeting  @relation(fields: [meetingId], references: [id])
-  status      String   @default("INITIALIZING")
-  // INITIALIZING → JOINING → RECORDING → FINISHED | ERROR
-  containerId String?  // Docker container ID for tracking
-  errorMsg    String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id            String   @id @default(cuid())
+  meetingId     String   @unique
+  meeting       Meeting  @relation(fields: [meetingId], references: [id])
+  status        String   @default("INITIALIZING")
+  containerId   String?
+  /// JoinFailureReason enum value — populated when join fails
+  failureReason String?
+  profilePath   String?
+  exitCode      Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Transcripts
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 model Transcript {
   id        String   @id @default(cuid())
   meetingId String   @unique
   meeting   Meeting  @relation(fields: [meetingId], references: [id])
-  // Array of { speaker: string, text: string, startMs: number, endMs: number }
+  /// Array of { speaker: string, text: string, startMs: number, endMs: number }
   content   Json
+  wordCount Int      @default(0)
   createdAt DateTime @default(now())
 }
 
-// ─────────────────────────────────────────────
-// AI Summaries
-// ─────────────────────────────────────────────
+/// Individual timestamped chunks — allows real-time streaming to frontend
+model TranscriptChunk {
+  id        String   @id @default(cuid())
+  meetingId String
+  meeting   Meeting  @relation(fields: [meetingId], references: [id])
+  speaker   String?
+  text      String
+  startMs   Int
+  endMs     Int
+  sequence  Int
+  createdAt DateTime @default(now())
 
-model Summary {
-  id            String   @id @default(cuid())
-  meetingId     String   @unique
-  meeting       Meeting  @relation(fields: [meetingId], references: [id])
-  overview      String
-  keyDecisions  Json     @default("[]") // string[]
-  actionItems   Json     @default("[]") // { owner, task, dueDate }[]
-  participants  Json     @default("[]") // { label, role }[]
-  createdAt     DateTime @default(now())
+  @@index([meetingId, sequence])
 }
 
-// ─────────────────────────────────────────────
-// Action Items (structured, queryable)
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Summaries
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Summary {
+  id           String   @id @default(cuid())
+  meetingId    String   @unique
+  meeting      Meeting  @relation(fields: [meetingId], references: [id])
+  overview     String
+  keyDecisions Json     @default("[]")  // string[]
+  actionItems  Json     @default("[]")  // { owner, task, dueDate }[]
+  participants Json     @default("[]")  // { label, role, summary }[]
+  modelUsed    String?  // "claude-sonnet-4" | "gemini-1.5-flash"
+  createdAt    DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Action Items (structured, queryable — separate from JSON in Summary)
+// ─────────────────────────────────────────────────────────────────────────────
 
 model ActionItem {
   id          String    @id @default(cuid())
@@ -127,7 +266,29 @@ model ActionItem {
   description String
   assignee    String?
   dueDate     DateTime?
-  status      String    @default("PENDING") // PENDING | COMPLETED
+  status      String    @default("PENDING")  // "PENDING" | "COMPLETED"
   createdAt   DateTime  @default(now())
+
+  @@index([meetingId])
+  @@index([status])
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Logs
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String   // e.g. "meeting.created" | "oauth.connected" | "bot.dispatched"
+  resource   String   // e.g. "Meeting" | "OAuthToken"
+  resourceId String?
+  metadata   Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([action])
+}

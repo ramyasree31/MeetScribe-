@@ -20,7 +20,11 @@
     "kafkajs": "^2.2.4",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@meetscribe/google-client": "workspace:*",
+    "@meetscribe/crypto": "workspace:*",
+    "@meetscribe/meeting-parser": "workspace:*",
+    "@meetscribe/bot-pool": "workspace:*"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.2",

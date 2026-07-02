@@ -29,6 +29,10 @@ export async function GET(
   const text = await res.text().catch(() => '')
   let data: any = {}
   try { data = text ? JSON.parse(text) : {} } catch { data = { error: text } }
+  // Remap Prisma bot.failureReason → bot.errorMsg expected by the UI
+  if (data?.bot?.failureReason !== undefined) {
+    data.bot.errorMsg = data.bot.failureReason
+  }
   return NextResponse.json(data, { status: res.status })
 }
 

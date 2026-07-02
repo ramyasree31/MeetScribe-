@@ -59,11 +59,8 @@ export default function MeetingDetailPage() {
         const prevStatus = prevStatusRef.current
         prevStatusRef.current = data.status
 
-        // Auto-redirect to the live/summary page when the meeting ends
-        // Transition: JOINING or LIVE → DONE or PROCESSING means the bot is done
-        const wasActive = prevStatus && ['JOINING', 'LIVE'].includes(prevStatus)
-        const isNowFinished = ['DONE', 'PROCESSING'].includes(data.status)
-        if (wasActive && isNowFinished) {
+        // Redirect to live page whenever the bot is active or the meeting is done
+        if (['JOINING', 'LIVE', 'PROCESSING', 'DONE'].includes(data.status)) {
           router.push(`/meetings/${id}/live`)
           return
         }
@@ -85,9 +82,8 @@ export default function MeetingDetailPage() {
       if (!res.ok) {
         setDispatchError(data?.error ?? data?.message ?? `Error ${res.status}`)
       } else {
-        setDispatchSuccess(true)
-        // Refresh meeting data immediately
-        await fetchMeeting()
+        // Redirect straight to the live page so the user can watch the bot join
+        router.push(`/meetings/${id}/live`)
       }
     } catch (err: any) {
       setDispatchError(err?.message ?? 'Network error — is the API running?')
@@ -322,7 +318,7 @@ export default function MeetingDetailPage() {
             <p className="text-sm text-ink3 mb-6 max-w-sm mx-auto">
               {meeting.status === 'SCHEDULED'
                 ? 'Click "Send Bot Now" above to immediately dispatch the AI bot to your Google Meet. Make sure your meeting is already started.'
-                : 'The bot encountered an error. Check that Docker Desktop is running and your meeting link is valid, then retry.'}
+                : 'The bot encountered an error. Check that your meeting link is valid and try again.'}
             </p>
             {meeting.bot?.errorMsg && (
               <div className="bg-cream2 rounded-lg px-4 py-3 text-xs font-mono text-ink3 text-left max-w-sm mx-auto break-all">
