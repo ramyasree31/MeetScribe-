@@ -1,0 +1,31 @@
+# ARM64-native auth image — VNC sign-in that actually works on Apple Silicon.
+FROM node:20-bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    x11vnc \
+    websockify \
+    novnc \
+    pulseaudio \
+    ca-certificates \
+    fonts-liberation \
+    libatk-bridge2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package.json ./
+RUN npm install
+
+# ARM64-native Playwright Chromium (no Google Chrome needed)
+RUN npx playwright install --with-deps chromium
+
+COPY . .
+RUN npm run build
+
+COPY auth-entrypoint.sh /app/auth-entrypoint.sh
+RUN chmod +x /app/auth-entrypoint.sh
+
+EXPOSE 6080
+
+ENTRYPOINT ["/app/auth-entrypoint.sh"]
