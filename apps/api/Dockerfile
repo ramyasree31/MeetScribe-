@@ -9,12 +9,13 @@ COPY apps/api ./apps/api
 RUN pnpm install --frozen-lockfile
 RUN cd packages/database && pnpm exec prisma generate
 
+RUN pnpm --filter @meetscribe/crypto build
+
 RUN pnpm --filter @meetscribe/bot-pool build
 
 RUN pnpm --filter @meetscribe/google-client build
 
 RUN pnpm --filter @meeting-bot/api build
-
 FROM node:22-alpine AS runner
 
 WORKDIR /app
