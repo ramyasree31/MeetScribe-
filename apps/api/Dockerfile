@@ -4,10 +4,15 @@ WORKDIR /app
 RUN apk add --no-cache openssl
 RUN npm install -g pnpm
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
-COPY packages/database ./packages/database
+COPY packages ./packages
 COPY apps/api ./apps/api
 RUN pnpm install --frozen-lockfile
 RUN cd packages/database && pnpm exec prisma generate
+
+RUN pnpm --filter @meetscribe/bot-pool build
+
+RUN pnpm --filter @meetscribe/google-client build
+
 RUN pnpm --filter @meeting-bot/api build
 
 FROM node:22-alpine AS runner
