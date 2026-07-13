@@ -8,10 +8,12 @@ COPY packages/database ./packages/database
 COPY packages/bot-pool ./packages/bot-pool
 COPY apps/bot-orchestrator ./apps/bot-orchestrator
 RUN pnpm install --frozen-lockfile
-RUN cd packages/database && pnpm exec prisma generate
-# Use pre-compiled dist if present, otherwise build from source
-RUN if [ ! -f apps/bot-orchestrator/dist/main.js ]; then pnpm --filter @meeting-bot/bot-orchestrator build; fi
 
+RUN cd packages/database && pnpm exec prisma generate
+
+RUN pnpm --filter @meetscribe/bot-pool build
+
+RUN pnpm --filter @meeting-bot/bot-orchestrator build
 FROM node:22-alpine AS runner
 
 WORKDIR /app
