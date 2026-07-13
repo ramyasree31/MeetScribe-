@@ -23,7 +23,7 @@ RUN apk add --no-cache openssl
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/packages/database ./packages/database
+COPY --from=builder /app/packages ./packages
 COPY --from=builder /app/apps/api ./apps/api
 
 USER appuser
