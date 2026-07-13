@@ -23,8 +23,9 @@ COPY --from=builder /app/apps/web ./apps/web
 USER appuser
 
 ENV NODE_ENV=production
-ENV PORT=4000
-EXPOSE 4000
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+EXPOSE 3000
 
 WORKDIR /app/apps/web
-CMD ["npm", "run", "start"]
+CMD ["sh", "-c", "next start -p ${PORT:-3000}"]
