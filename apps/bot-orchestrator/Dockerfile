@@ -11,8 +11,8 @@ RUN pnpm install --frozen-lockfile
 
 RUN cd packages/database && pnpm exec prisma generate
 
+RUN pnpm --filter @meetscribe/crypto build
 RUN pnpm --filter @meetscribe/bot-pool build
-
 RUN pnpm --filter @meeting-bot/bot-orchestrator build
 FROM node:22-alpine AS runner
 
